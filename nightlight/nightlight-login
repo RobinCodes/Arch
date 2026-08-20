@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Applies the scheduled intensity as soon as the XFCE session comes up, so the
+# desktop is already warm on arrival. Without this the first colour change came
+# from the timer's OnStartupSec=30 tick, i.e. ~40s into the session, because the
+# X server starts with neutral gamma ramps and nothing else sets them.
+#
+# Runs from ~/.config/autostart/nightlight-login.desktop, which inherits the
+# real session DISPLAY/XAUTHORITY -- unlike the systemd timer, which arms before
+# xfce4-session imports them.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# xfsettingsd's startup display pass can reconfigure the CRTC and wipe the gamma
+# ramp we just set (same reason apply-touchpad.sh applies twice), so re-assert
+# once it has settled. nightlight-auto is idempotent -- redshift -P resets the
+# ramp before each set -- so the second pass is free of side effects.
+"$DIR/nightlight-auto"
+sleep 3
+"$DIR/nightlight-auto"

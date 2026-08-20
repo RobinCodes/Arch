@@ -1,0 +1,100 @@
+#!/bin/bash
+# nightlight [--auto] [0-100]   — get or set the night light intensity.
+# nightlight --mode [auto|manual] — get or set how nightlight-auto behaves.
+#
+# 0 = off (6500K, neutral), 100 = strongest (2500K, very warm).
+#
+# Two modes:
+#   auto    nightlight-auto drives the intensity from the time of day. Setting
+#           a value by hand parks an override until the next 07:00/19:00
+#           boundary, then the schedule takes back over.
+#   manual  nightlight-auto does nothing; whatever you set stays put.
+#
+# --auto is how nightlight-auto sets the value without arming an override.
+# --mode only writes the setting; run nightlight-auto to apply it right away.
+set -e
+CONF="$HOME/.config/redshift/redshift.conf"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nightlight"
+OVERRIDE="$STATE/override-until"
+MODE_FILE="$STATE/mode"
+
+current_temp() {
+    grep -oP '(?<=^temp-day=)\d+' "$CONF"
+}
+
+# Anything unset or unrecognised means auto, so a missing//corrupt state file
+# fails back to the scheduled behaviour rather than freezing the screen.
+current_mode() {
+    local m
+    m=$(cat "$MODE_FILE" 2>/dev/null || true)
+    case "$m" in
+        manual) echo manual ;;
+        *)      echo auto ;;
+    esac
+}
+
+# Epoch of the next day/night transition, matching nightlight-auto's 07:00 and
+# 19:00 edges.
+next_boundary() {
+    local h
+    h=$(date +%-H)
+    if [ "$h" -lt 7 ]; then
+        date -d 'today 07:00' +%s
+    elif [ "$h" -lt 19 ]; then
+        date -d 'today 19:00' +%s
+    else
+        date -d 'tomorrow 07:00' +%s
+    fi
+}
+
+if [ "$1" = "--mode" ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        current_mode
+        exit 0
+    fi
+    case "$1" in
+        auto|manual) ;;
+        *) echo "usage: nightlight --mode [auto|manual]" >&2; exit 1 ;;
+    esac
+    mkdir -p "$STATE"
+    printf '%s\n' "$1" > "$MODE_FILE"
+    # Either direction makes a pending hold meaningless.
+    rm -f "$OVERRIDE"
+    echo "night light mode: $1"
+    exit 0
+fi
+
+auto=0
+if [ "$1" = "--auto" ]; then
+    auto=1
+    shift
+fi
+
+if [ $# -eq 0 ]; then
+    temp=$(current_temp)
+    pct=$(( (6500 - temp) / 40 ))
+    echo "current intensity: ${pct}% ($(current_mode), ${temp}K)"
+    exit 0
+fi
+
+pct=$1
+if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -gt 100 ]; then
+    echo "usage: nightlight [--auto] [0-100]" >&2
+    exit 1
+fi
+
+temp=$((6500 - pct * 40))
+sed -i "s/^temp-day=.*/temp-day=$temp/; s/^temp-night=.*/temp-night=$temp/" "$CONF"
+# -P resets the existing gamma ramp first; without it redshift stacks each
+# adjustment on top of the last and the screen creeps redder on every call.
+redshift -P -O "$temp" >/dev/null
+
+# Only worth arming an override when there is a schedule to hold off.
+if [ "$auto" -eq 0 ] && [ "$(current_mode)" = auto ]; then
+    mkdir -p "$STATE"
+    next_boundary > "$OVERRIDE"
+    echo "night light set to ${pct}% (${temp}K), holding until $(date -d "@$(cat "$OVERRIDE")" '+%H:%M')"
+else
+    echo "night light set to ${pct}% (${temp}K)"
+fi

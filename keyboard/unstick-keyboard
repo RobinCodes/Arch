@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# unstick-keyboard — get the keyboard back after xfce4-screensaver wedges it,
+# without a reboot, using only the mouse.
+#
+# The failure this undoes
+# -----------------------
+# xfce4-screensaver holds a logind *delay* inhibitor on sleep so it can put the
+# lock screen up before the machine suspends. Locking means XGrabKeyboard +
+# XGrabPointer on the root window. logind only waits InhibitDelayMaxSec (5s by
+# default) for that inhibitor to be released; past it, it suspends anyway and
+# systemd freezes the whole user.slice — screensaver included, mid-lock.
+#
+# What comes back from resume is a screensaver stuck partway through locking,
+# still holding the keyboard grab, with no lock window on screen to type into.
+# Every keystroke on the machine is delivered to that grab and vanishes. The
+# pointer grab usually isn't taken (or is dropped), which is why the mouse
+# keeps working and the keyboard doesn't — and why this script has to be
+# clickable rather than typable.
+#
+# The screen also stops blanking on a lid close, and any later lock attempt
+# fails with xfce4-session's "Failed to lock the screen", because the
+# screensaver's state machine never came back.
+#
+# X11 releases every grab a client holds the moment its connection drops, so
+# the reliable fix is to kill the screensaver and let it come back clean. This
+# takes a gentler route first and only escalates if that didn't free things.
+#
+# Usage: unstick-keyboard [--quiet] [--dry-run]
+
+set -euo pipefail
+
+quiet=false
+dry_run=false
+for arg in "$@"; do
+	case $arg in
+		--quiet) quiet=true ;;
+		--dry-run) dry_run=true ;;
+		-h|--help) sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		*) echo "unstick-keyboard: unknown option $arg" >&2; exit 1 ;;
+	esac
+done
+
+say() { $quiet || echo "$*"; }
+run() { $dry_run && { say "  would run: $*"; return 0; }; "$@"; }
+
+# Runnable from a panel launcher (DISPLAY already set) *and* from a TTY or ssh,
+# which is the fallback when even the pointer is grabbed. Ctrl+Alt+F2 still
+# switches VT under an X grab, so that route is worth keeping open.
+if [ -z "${DISPLAY:-}" ]; then
+	export DISPLAY=:0
+	say "no DISPLAY, assuming :0"
+fi
+if [ -z "${XAUTHORITY:-}" ]; then
+	for candidate in "$HOME/.Xauthority" /run/user/"$(id -u)"/gdm/Xauthority; do
+		[ -f "$candidate" ] && { export XAUTHORITY="$candidate"; break; }
+	done
+fi
+
+did_something=false
+
+# --- 1. Resume anything left suspended --------------------------------------
+# oom-defender freezes with SIGSTOP and resumes on its own, but only while it
+# is alive to remember what it froze. Killed or crashed mid-episode, its
+# victims stay stopped forever and a restarted instance has no record of them.
+# A stopped process holding an X grab looks exactly like the bug above.
+#
+# Caveat: a shell job you suspended yourself with Ctrl+Z is also state T and
+# will be resumed too. That is the intended trade — this runs when the machine
+# is already unusable.
+mapfile -t stopped < <(ps -u "$(id -u)" -o pid=,stat=,comm= | awk '$2 ~ /^T/ {print $1" "$3}')
+if [ ${#stopped[@]} -gt 0 ]; then
+	say "resuming ${#stopped[@]} suspended process(es):"
+	for entry in "${stopped[@]}"; do
+		pid=${entry%% *}
+		name=${entry#* }
+		say "  SIGCONT $name[$pid]"
+		run kill -CONT "$pid" 2>/dev/null || true
+	done
+	did_something=true
+else
+	say "no suspended processes"
+fi
+
+# --- 2. Ask the screensaver to stand down -----------------------------------
+# Costs nothing and keeps the session's unlock history intact when it works.
+# A wedged screensaver ignores this, hence the timeout and step 3.
+if $dry_run; then
+	say "  would run: xfce4-screensaver-command -d"
+elif command -v xfce4-screensaver-command >/dev/null; then
+	if timeout 5 xfce4-screensaver-command -d >/dev/null 2>&1; then
+		say "asked xfce4-screensaver to deactivate"
+	else
+		say "xfce4-screensaver did not answer (this is the wedged case)"
+	fi
+fi
+
+# --- 3. Drop the grab by dropping the client --------------------------------
+# pgrep -x would miss it: the kernel keeps 15 characters of a process name and
+# "xfce4-screensaver" is 17, so it is only ever visible as "xfce4-screensav".
+mapfile -t saver_pids < <(pgrep -u "$(id -u)" -f '^/usr/bin/xfce4-screensaver$|^xfce4-screensaver$' 2>/dev/null || true)
+if [ ${#saver_pids[@]} -gt 0 ]; then
+	for pid in "${saver_pids[@]}"; do
+		say "restarting xfce4-screensaver[$pid] — this releases its X grabs"
+		# SIGCONT first: a stopped process cannot act on SIGTERM, and killing
+		# it while stopped would leave the grab held until the X server
+		# notices the socket close.
+		run kill -CONT "$pid" 2>/dev/null || true
+		run kill -TERM "$pid" 2>/dev/null || true
+	done
+	did_something=true
+
+	# Give it a moment to exit cleanly, then insist.
+	if ! $dry_run; then
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			pgrep -u "$(id -u)" -f 'xfce4-screensav' >/dev/null 2>&1 || break
+			sleep 0.3
+		done
+		if pgrep -u "$(id -u)" -f 'xfce4-screensav' >/dev/null 2>&1; then
+			say "  still alive, sending SIGKILL"
+			pkill -KILL -u "$(id -u)" -f 'xfce4-screensav' 2>/dev/null || true
+			sleep 0.5
+		fi
+	fi
+
+	# Bring it back. Without this the session has no locker at all, and
+	# Ctrl+Alt+L would fail the same way the lid close did.
+	say "starting a fresh xfce4-screensaver"
+	if ! $dry_run; then
+		setsid xfce4-screensaver >/dev/null 2>&1 &
+		disown 2>/dev/null || true
+	fi
+else
+	say "xfce4-screensaver was not running"
+	if ! $dry_run && command -v xfce4-screensaver >/dev/null; then
+		say "starting it"
+		setsid xfce4-screensaver >/dev/null 2>&1 &
+		disown 2>/dev/null || true
+	fi
+fi
+
+# --- 4. Report --------------------------------------------------------------
+# The notification matters more than the terminal output: this is normally
+# launched from a panel button by someone who cannot type, and a button that
+# gives no feedback is indistinguishable from one that did nothing.
+if ! $dry_run && command -v notify-send >/dev/null; then
+	if $did_something; then
+		notify-send -i input-keyboard -u critical "Keyboard unstuck" \
+			"Released the screensaver's input grab and restarted it. If keys still do nothing, log out and back in." 2>/dev/null || true
+	else
+		notify-send -i input-keyboard "Nothing was stuck" \
+			"No suspended processes and no screensaver grab found — the keyboard problem is something else." 2>/dev/null || true
+	fi
+fi
+
+say "done"

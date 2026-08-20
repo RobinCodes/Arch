@@ -1,0 +1,43 @@
+[Unit]
+Description=OOM Defender — freeze then kill the memory hog before the machine locks up
+Documentation=file:/usr/local/bin/oom-defender
+DefaultDependencies=no
+After=sysinit.target local-fs.target swap.target
+Before=multi-user.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/oom-defender
+ExecReload=/bin/kill -HUP $MAINPID
+
+# A watchdog that dies is worse than no watchdog, because you stop expecting
+# the OOM. Restart forever, with no start-limit to give up against.
+Restart=always
+RestartSec=2
+
+# Never be the victim. -1000 makes the kernel OOM killer skip us outright, and
+# the daemon skips anything at or below -900 itself.
+OOMScoreAdjust=-1000
+
+# Be schedulable when nothing else is: under thrashing, a normal-priority
+# watchdog waits its turn behind the very processes it needs to stop.
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+# mlockall() needs this — systemd's 8M default is not enough for a Python
+# process, and an unlocked watchdog can be paged out precisely when it is
+# needed. MemorySwapMax is the cgroup-side belt to that braces.
+LimitMEMLOCK=infinity
+MemorySwapMax=0
+MemoryMin=24M
+
+# Deliberately light sandboxing. The daemon has to signal processes in every
+# other user's session and read their environment to find the notification
+# bus, so PrivateUsers, ProtectProc and PrivateTmp are all off the table.
+# Read-only filesystem is the one restriction that costs nothing here.
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

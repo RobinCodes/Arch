@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# nolock — skip the password prompt when the laptop wakes, lid or sleep.
+#
+# Five separate XFCE switches can each put a lock screen in front of the
+# session, and every one of them defaults to locking, so turning off any one on
+# its own still leaves you typing a password:
+#
+#   xfce4-power-manager  lock-screen-suspend-hibernate
+#                        locks the screen just before it starts a suspend
+#   xfce4-screensaver    /lock/sleep-activation
+#                        locks on logind's PrepareForSleep signal
+#   xfce4-screensaver    /lock/saver-activation/enabled
+#                        locks when the idle screensaver kicks in — which is
+#                        what actually catches you on an idle suspend, since
+#                        the saver activates on the way down
+#   xfce4-power-manager  lid-action-on-ac
+#   xfce4-power-manager  lid-action-on-battery
+#                        what closing the lid does at all — and their default,
+#                        3, *is* "lock screen"
+#
+# The lid pair is the one that took a while to find, because none of the three
+# above are wrong: they gate locking *around a sleep*, and closing the lid on
+# this machine never sleeps. xfce4-power-manager holds a logind
+# handle-lid-switch inhibitor, so it decides what a lid close means rather than
+# logind, and left alone it decides "lock the screen" — no suspend, no
+# PrepareForSleep, no screensaver, nothing for the other three to veto. Hence a
+# laptop that locked on every lid close while nolock reported itself on.
+#
+# On is DPMS (0): the display goes off, the session keeps running, and opening
+# the lid comes straight back. Off restores 3.
+#
+# /lock/enabled is deliberately left alone: it is the master switch, and with
+# it on, Ctrl+Alt+L still locks on demand even while nolock is on.
+#
+# The state is the xfconf values themselves rather than a file beside them, so
+# it survives a reboot and can't drift from what XFCE is actually doing. The
+# file this does keep is a snapshot of the pre-nolock values, so `off` restores
+# what was there instead of assuming the defaults.
+#
+# Usage: nolock [status|on|off|toggle] [--quiet]
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nolock"
+SAVED="$STATE_DIR/saved"
+
+# channel<TAB>property<TAB>type<TAB>nolock value<TAB>locking value
+#
+# The locking value does double duty: it is the value that means "this key
+# would lock", and it is what `off` writes to put the key back. Those can be
+# the same column because for all five it is also the compiled-in default the
+# key carries while unset, so an unset key reads as locking and restores to the
+# value it would have had anyway.
+#
+# That is what lets one rule — a key locks when its effective value equals its
+# locking value — cover both a bool defaulting to true and a lid action that is
+# a seven-member enum (0 DPMS, 1 suspend, 2 hibernate, 3 lock screen, 4
+# nothing, 5 hybrid sleep, 6 shutdown) where only 3 locks. It also means a lid
+# set to suspend by hand reads as not-locking and is left alone by `on`, rather
+# than being flattened to DPMS for no reason.
+KEYS=(
+	"xfce4-power-manager	/xfce4-power-manager/lock-screen-suspend-hibernate	bool	false	true"
+	"xfce4-screensaver	/lock/sleep-activation	bool	false	true"
+	"xfce4-screensaver	/lock/saver-activation/enabled	bool	false	true"
+	"xfce4-power-manager	/xfce4-power-manager/lid-action-on-ac	uint	0	3"
+	"xfce4-power-manager	/xfce4-power-manager/lid-action-on-battery	uint	0	3"
+)
+
+quiet=false
+
+die() {
+	echo "nolock: $*" >&2
+	exit 1
+}
+
+raw() { # channel property -> the value, or "unset"
+	local value
+	if value=$(xfconf-query -c "$1" -p "$2" 2>/dev/null); then
+		echo "$value"
+	else
+		echo unset
+	fi
+}
+
+effective() { # channel property locking-value -> the value the daemon acts on
+	local value
+	value=$(raw "$1" "$2")
+	if [ "$value" = unset ]; then
+		echo "$3"
+	else
+		echo "$value"
+	fi
+}
+
+locks() { # channel property locking-value -> 0 if this key would lock the screen
+	[ "$(effective "$1" "$2" "$3")" = "$3" ]
+}
+
+type_of() { # channel property -> bool|uint, from the table above
+	local channel property type rest
+	while IFS=$'\t' read -r channel property type rest; do
+		if [ "$channel" = "$1" ] && [ "$property" = "$2" ]; then
+			echo "$type"
+			return 0
+		fi
+	done < <(printf '%s\n' "${KEYS[@]}")
+	die "no type known for $1 $2"
+}
+
+set_value() { # channel property type value
+	xfconf-query -c "$1" -p "$2" --create --type "$3" --set "$4" >/dev/null
+	# Read back rather than trusting the write: these keys are bound to
+	# running daemons that can write their own copy over the top, and a
+	# restore that half-lands leaves a laptop that doesn't lock while nolock
+	# reports itself off.
+	local now
+	now=$(raw "$1" "$2")
+	[ "$now" = "$4" ] || die "$1 $2 reads $now after being set to $4"
+}
+
+restore_locking() {
+	# Writes the locking value rather than removing the property with --reset,
+	# which would be the tidier way back to a shipped default but isn't
+	# reliable: xfce4-power-manager binds its keys both ways, so removing the
+	# property makes the daemon write its in-memory copy — still the nolock
+	# value — straight back. That failure is silent and points the wrong way,
+	# leaving a laptop that no longer locks after nolock was turned off. An
+	# explicit write is the same value the default would have given, and it
+	# sticks.
+	set_value "$1" "$2" "$(type_of "$1" "$2")" "$3"
+}
+
+state() {
+	local channel property type nolock_value lock_value
+	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
+		if locks "$channel" "$property" "$lock_value"; then
+			echo off
+			return
+		fi
+	done < <(printf '%s\n' "${KEYS[@]}")
+	echo on
+}
+
+snapshot() {
+	# Per key rather than all-or-nothing on the file existing, so a key added
+	# to the table above is recorded the first time it is turned off even
+	# though the file is already there from an earlier `on` — without that,
+	# the lid pair would have been switched to DPMS with nothing saying what
+	# to put back. Keys already recorded are left alone: re-recording would
+	# overwrite the originals with the values nolock itself just wrote.
+	mkdir -p "$STATE_DIR"
+	local channel property type nolock_value lock_value
+	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
+		if [ -e "$SAVED" ] && cut -f1,2 "$SAVED" | grep -qxF "$channel	$property"; then
+			continue
+		fi
+		printf '%s\t%s\t%s\n' "$channel" "$property" "$(raw "$channel" "$property")" >>"$SAVED"
+	done < <(printf '%s\n' "${KEYS[@]}")
+}
+
+enable() {
+	snapshot
+	local channel property type nolock_value lock_value
+	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
+		# Only the keys actually standing in the way, so anything already
+		# harmless keeps whatever value it was given.
+		if locks "$channel" "$property" "$lock_value"; then
+			set_value "$channel" "$property" "$type" "$nolock_value"
+		fi
+	done < <(printf '%s\n' "${KEYS[@]}")
+}
+
+disable() {
+	local channel property type nolock_value lock_value value saved
+	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
+		saved=unset
+		if [ -e "$SAVED" ]; then
+			# Falls through to the locking value when the key isn't in the
+			# file — the keys were flipped by hand, the state directory was
+			# cleared, or the table grew since the snapshot was taken.
+			saved=$(awk -F'\t' -v c="$channel" -v p="$property" \
+				'$1 == c && $2 == p { print $3; exit }' "$SAVED")
+			[ -n "$saved" ] || saved=unset
+		fi
+		if [ "$saved" = unset ]; then
+			restore_locking "$channel" "$property" "$lock_value"
+		else
+			set_value "$channel" "$property" "$type" "$saved"
+		fi
+	done < <(printf '%s\n' "${KEYS[@]}")
+	rm -f "$SAVED"
+}
+
+notify() {
+	if $quiet; then
+		return 0
+	fi
+	command -v notify-send >/dev/null || return 0
+	# The synchronous hint replaces the previous nolock bubble instead of
+	# stacking one per toggle.
+	local args=(-a nolock -h string:x-canonical-private-synchronous:nolock)
+	if [ "$1" = on ]; then
+		notify-send "${args[@]}" -i changes-allow-symbolic \
+			"Wake login off" "Opening the lid or waking won't ask for your password." || true
+	else
+		notify-send "${args[@]}" -i changes-prevent-symbolic \
+			"Wake login on" "Opening the lid or waking asks for your password again." || true
+	fi
+}
+
+command -v xfconf-query >/dev/null || die "xfconf-query not found"
+
+action=status
+for arg in "$@"; do
+	case "$arg" in
+	-q | --quiet) quiet=true ;;
+	status | on | off | toggle) action=$arg ;;
+	-h | --help)
+		# The header block, however long it grows.
+		awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+		exit 0
+		;;
+	*) die "unknown argument: $arg" ;;
+	esac
+done
+
+case "$action" in
+status)
+	state
+	exit 0
+	;;
+toggle)
+	[ "$(state)" = on ] && action=off || action=on
+	;;
+esac
+
+if [ "$action" = on ]; then enable; else disable; fi
+
+now=$(state)
+[ "$now" = "$action" ] || die "wanted $action but the settings read back as $now"
+notify "$now"
+echo "$now"

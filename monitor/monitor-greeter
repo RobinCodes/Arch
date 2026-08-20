@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# monitor-greeter <user> [-- <next-script> [args...]] — give the login screen the
+# same display layout the session already uses, so the greeter draws on the
+# monitor you are actually looking at.
+#
+# LightDM runs this as root from
+# /etc/lightdm/lightdm.conf.d/60-monitor.conf, as display-setup-script: the X
+# server is up, nothing has drawn on it yet, and the greeter has not started.
+#
+#
+# WHAT THIS IS FOR
+#
+# LightDM starts X with no display configuration at all, so the modesetting
+# driver falls back to "enable every connected output, left to right, none of
+# them primary". On this machine, from /var/log/Xorg.0.log, every boot:
+#
+#     Output eDP-1  using initial mode 1366x768  +0+0
+#     Output HDMI-1 using initial mode 3840x2160 +1366+0
+#
+# That is a 5206x2160 desktop whose origin — and whose monitor 0, which is where
+# lightdm-gtk-greeter puts the login window — is the laptop panel. Boot with the
+# lid shut and the login box is drawn onto a panel that is switched off, while
+# the external monitor shows nothing but the greeter's background. Opening the
+# lid does not rescue it: at greeter time there is no xfce4-power-manager and no
+# session, so nothing re-drives eDP-1 and its backlight stays down
+# (/sys/class/backlight/intel_backlight/bl_power reads 4). Pulling the HDMI
+# cable does rescue it, because the hotplug forces a fresh modeset onto the only
+# output left — which is the unplug/log-in/replug dance this removes.
+#
+# xfsettingsd fixes all of this the instant the session starts, out of the saved
+# profile in displays.xml. The greeter simply never had that profile. So this
+# reads the same file and applies the same layout roughly two seconds earlier.
+#
+#
+# WHY IT READS displays.xml INSTEAD OF CARRYING ITS OWN COPY OF THE LAYOUT
+#
+# One source of truth. Change the arrangement in xfce4-display-settings and the
+# login screen follows on the next boot, with nothing here to update and no way
+# for the two to drift apart. It also means the greeter and the session agree
+# pixel for pixel, so logging in is not a mode change: no flicker, no resize,
+# and the 4K panel is scaled to a readable size at the greeter too rather than
+# rendering the password box at native 3840x2160.
+#
+# The file belongs to the user, and this runs as root before anyone has
+# authenticated, so it is read under setpriv as that user and every field that
+# comes back is re-checked against a regex before it reaches xrandr — same
+# reasoning as nightlight-greeter, which drops privileges for the same kind of
+# question. The worst a tampered displays.xml can do is choose a screen
+# resolution for the login screen.
+#
+#
+# ORDER, AND THE CHAIN
+#
+# LightDM allows exactly one display-setup-script per seat, and nightlight
+# already wanted it. So this one owns the hook and runs the other afterwards,
+# via everything after `--`. That is not just politeness about a shared slot:
+# reconfiguring a CRTC wipes the gamma ramp, so the night light *has* to be
+# applied after the layout or the login screen comes up cold. install-monitor-
+# greeter.sh reads the existing nightlight drop-in and wires the chain for you.
+set -u
+
+# Absolute paths throughout: this runs as root out of LightDM, whose PATH is
+# whatever systemd handed the display manager.
+XRANDR=/usr/bin/xrandr
+GETENT=/usr/bin/getent
+SETPRIV=/usr/bin/setpriv
+PYTHON=/usr/bin/python3
+
+USER_NAME=${1:-}
+shift || true
+# Everything after `--` is the next setup script to run once the layout is up.
+NEXT=()
+if [[ ${1:-} == "--" ]]; then
+    shift
+    NEXT=("$@")
+fi
+
+# Run the chained script and leave. Always succeeds: a failed setup script is
+# LightDM's problem to log, and a login screen that will not come up because a
+# monitor was arranged wrongly is a much worse trade than a badly arranged one.
+finish() {
+    if [[ ${#NEXT[@]} -gt 0 && -x ${NEXT[0]} && ${MONITOR_GREETER_DRYRUN:-} != 1 ]]; then
+        "${NEXT[@]}" || true
+    fi
+    exit 0
+}
+
+# LightDM runs setup scripts for every seat it brings up, including ones with no
+# X server to arrange outputs on. Nothing to do there.
+[[ -n ${DISPLAY:-} ]] || finish
+[[ -x $XRANDR ]] || finish
+
+query=$("$XRANDR" --query 2>/dev/null) || finish
+[[ -n $query ]] || finish
+
+# Outputs the driver can see a display on right now. This is the authority on
+# what is physically attached; displays.xml only gets a say about outputs that
+# appear in here.
+mapfile -t connected < <(printf '%s\n' "$query" | awk '$2 == "connected" { print $1 }')
+[[ ${#connected[@]} -gt 0 ]] || finish
+
+is_connected() {
+    local o
+    for o in "${connected[@]}"; do [[ $o == "$1" ]] && return 0; done
+    return 1
+}
+
+# The mode the panel actually asked for, marked `+` in xrandr's listing. Used
+# only by the fallback layout; the profile names its own.
+preferred_mode() {
+    printf '%s\n' "$query" | awk -v want="$1" '
+        $1 == want && $2 == "connected" { inside = 1; next }
+        /^[^ \t]/                       { inside = 0 }
+        inside && /\+/                  { print $1; exit }
+    '
+}
+
+# eDP/LVDS is the built-in panel; anything else is a monitor on a cable.
+is_internal() { [[ $1 == eDP* || $1 == LVDS* || $1 == DSI* ]]; }
+
+
+# ---------------------------------------------------------------------------
+# What the session would do, out of the user's saved XFCE profile.
+# ---------------------------------------------------------------------------
+
+# Emits one validated `output active res rate scale primary x y` line per output
+# in the active profile. Runs as the user, under a scrubbed environment, and
+# prints nothing at all on a missing, unparseable or unexpected file — every
+# failure here just falls through to the fallback layout below.
+read_profile() {
+    local passwd_line uid gid home_dir
+    passwd_line=$($GETENT passwd "$USER_NAME" 2>/dev/null) || return 1
+    IFS=: read -r _ _ uid gid _ home_dir _ <<<"$passwd_line"
+    [[ -n ${home_dir:-} ]] || return 1
+    [[ -x $SETPRIV && -x $PYTHON ]] || return 1
+
+    $SETPRIV --reuid "$uid" --regid "$gid" --init-groups --inh-caps=-all -- \
+        /usr/bin/env -i HOME="$home_dir" PATH=/usr/bin \
+        "$PYTHON" -c '
+import sys, xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+try:
+    root = ET.parse(path).getroot()
+except Exception:
+    sys.exit(0)
+
+# <channel name="displays"> holds one <property> per saved profile plus a few
+# scalars; ActiveProfile names which of the profiles is the live one.
+top = {p.get("name"): p for p in root.findall("property")}
+active = top.get("ActiveProfile")
+profile = top.get(active.get("value")) if active is not None else None
+if profile is None:
+    sys.exit(0)
+
+def val(node, name, default=""):
+    child = node.find(f"property[@name={name!r}]")
+    return default if child is None else (child.get("value") or default)
+
+for out in profile.findall("property"):
+    name = out.get("name") or ""
+    if val(out, "Active").lower() != "true":
+        print(f"{name}\toff\t-\t-\t-\t-\t-\t-")
+        continue
+    pos = out.find("property[@name='Position']")
+    print("\t".join((
+        name,
+        "on",
+        val(out, "Resolution", "-"),
+        val(out, "RefreshRate", "-"),
+        val(out, "Scale", "-"),
+        val(out, "Primary", "false"),
+        val(pos, "X", "0") if pos is not None else "0",
+        val(pos, "Y", "0") if pos is not None else "0",
+    )))
+' "$home_dir/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml" 2>/dev/null
+}
+
+# Turn the profile into a single xrandr invocation. One invocation on purpose:
+# every --output in one command is one modeset, so the screen never passes
+# through a state with no output enabled.
+build_from_profile() {
+    local -a args=()
+    local name state res rate scale primary px py seen=" "
+    local enabled=0 saw_primary=0
+
+    while IFS=$'\t' read -r name state res rate scale primary px py; do
+        [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+        seen+="$name "
+        is_connected "$name" || {
+            # In the profile but not on the machine right now — undocked, or a
+            # different monitor. The profile does not describe this hardware.
+            [[ $state == off ]] && continue
+            return 1
+        }
+
+        if [[ $state == off ]]; then
+            args+=(--output "$name" --off)
+            continue
+        fi
+
+        [[ $res =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || return 1
+        args+=(--output "$name" --mode "$res")
+
+        # Rates and scales are advisory: a profile written against a monitor's
+        # other cable can name a rate this port cannot do, and xrandr fails the
+        # whole command over it. Both are re-tried without in run_layout().
+        [[ $rate =~ ^[0-9]+(\.[0-9]+)?$ ]] && args+=(--rate "$rate")
+        # The [1-9] is not decoration: a scale of 0 collapses the framebuffer
+        # and takes the X server with it.
+        [[ $scale =~ ^[0-9]+(\.[0-9]+)?$ && $scale =~ [1-9] ]] && args+=(--scale "${scale}x${scale}")
+
+        [[ $px =~ ^-?[0-9]{1,5}$ ]] || px=0
+        [[ $py =~ ^-?[0-9]{1,5}$ ]] || py=0
+        args+=(--pos "${px}x${py}")
+
+        if [[ ${primary,,} == true && $saw_primary -eq 0 ]]; then
+            args+=(--primary)
+            saw_primary=1
+        fi
+        enabled=$((enabled + 1))
+    done
+
+    # Never hand back a layout that lights nothing up, and never one where the
+    # greeter would again have to guess which monitor is the important one.
+    [[ $enabled -gt 0 && $saw_primary -eq 1 ]] || return 1
+
+    # Anything plugged in that the profile has never heard of — a projector, a
+    # second monitor added since the profile was saved — would otherwise keep
+    # whatever X guessed for it and re-create the bug on a third screen.
+    local o
+    for o in "${connected[@]}"; do
+        [[ $seen == *" $o "* ]] || args+=(--output "$o" --off)
+    done
+
+    printf '%s\n' "${args[@]}"
+}
+
+# No usable profile: put the login screen on the external monitor if there is
+# one, and on the built-in panel if there is not. This is the whole bug fix on
+# its own — the scale and placement from the profile are what make the greeter
+# and the session look identical, not what make the greeter visible.
+build_fallback() {
+    local -a args=()
+    local o mode target=""
+
+    for o in "${connected[@]}"; do
+        is_internal "$o" || { target=$o; break; }
+    done
+    [[ -n $target ]] || target=${connected[0]}
+
+    mode=$(preferred_mode "$target")
+    [[ $mode =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || return 1
+
+    args+=(--output "$target" --mode "$mode" --pos 0x0 --primary)
+    for o in "${connected[@]}"; do
+        [[ $o == "$target" ]] && continue
+        args+=(--output "$o" --off)
+    done
+
+    printf '%s\n' "${args[@]}"
+}
+
+# Apply, then retreat one step at a time rather than giving up: drop --rate and
+# --scale (the two fields most likely to be rejected by this port) and try the
+# same arrangement again, since a login screen on the right monitor at the wrong
+# refresh rate is still a fixed login screen.
+run_layout() {
+    local -a args=("$@") plain=()
+    local a skip=0
+
+    # MONITOR_GREETER_DRYRUN=1 prints the arrangement instead of applying it, so
+    # install-monitor-greeter.sh can show you what the login screen is about to
+    # do while you are still looking at a working desktop.
+    if [[ ${MONITOR_GREETER_DRYRUN:-} == 1 ]]; then
+        printf 'xrandr'; printf ' %q' "${args[@]}"; printf '\n'
+        return 0
+    fi
+
+    "$XRANDR" "${args[@]}" 2>/dev/null && return 0
+
+    for a in "${args[@]}"; do
+        if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+        case $a in
+            --rate|--scale) skip=1 ;;
+            *) plain+=("$a") ;;
+        esac
+    done
+    [[ ${#plain[@]} -eq ${#args[@]} ]] && return 1
+    "$XRANDR" "${plain[@]}" 2>/dev/null
+}
+
+
+# ---------------------------------------------------------------------------
+
+mapfile -t layout < <(read_profile | build_from_profile)
+if [[ ${#layout[@]} -gt 0 ]]; then
+    run_layout "${layout[@]}" && finish
+fi
+
+mapfile -t layout < <(build_fallback)
+if [[ ${#layout[@]} -gt 0 ]]; then
+    run_layout "${layout[@]}"
+fi
+
+# Nothing applied cleanly: leave X's auto-configuration exactly as it was. It is
+# the state this script was written to improve on, but it is a working screen
+# somewhere, and half an arrangement is worse than none.
+finish

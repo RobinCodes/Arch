@@ -1,0 +1,511 @@
+#!/bin/bash
+# zen — strip the desktop down to one app (or a few) and freeze the screen.
+#
+# Zen deliberately stays inside the running X session. The night light is a
+# one-shot gamma ramp pushed into this X server (../nightlight/nightlight calls
+# `redshift -P -O`), and gamma ramps are per-X-server state: a kiosk session on
+# a second VT, or restarting xfce4-session, would drop the ramp and snap the
+# screen back to a cold 6500K the moment zen started. So zen tears down the
+# *visible* layer and stops the *automation*, and never touches the display
+# pipeline itself. Whatever warmth and brightness are on screen when you enter
+# are exactly what stays until you leave.
+#
+#   zen NAME...     enter zen. Each NAME is a set from apps.conf or any
+#                   command; give more than one for multi-app zen:
+#                     zen write            one app
+#                     zen work             a multi-app set from apps.conf
+#                     zen firefox thunar   any two commands, no config needed
+#   zen --pick      pick from every installed application, or a set, in a
+#                   dialog; tick several boxes for multi-app zen. This is the
+#                   one that needs no terminal    (also <Super><Shift>Z)
+#   zen --exit      leave zen (also <Super>Z, also the on-screen button)
+#   zen --status    report whether zen is active and what it changed
+#   zen --dry-run   show what entering would close and stop, then stop
+#   zen --yes       skip the "close everything?" confirmation
+#   zen --apps      list every launchable app as `name<TAB>command`
+set -uo pipefail
+
+ZEN_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$ZEN_DIR/zen"
+WM="$ZEN_DIR/zen-wm.py"
+APPS_LIST="$ZEN_DIR/zen-apps.py"
+PICKER="$ZEN_DIR/zen-pick.py"
+BUTTON="$ZEN_DIR/zen-button.py"
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/zen/apps.conf"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/zen"
+SESSION="$STATE/session"
+LOG="$STATE/zen.log"
+
+UNSET="__unset__"
+# A WM_CLASS of its own is how the exit button stays out of the fullscreen
+# watcher's way; without it the button is just another new top-level window and
+# gets stretched over the app it is meant to sit on top of.
+BUTTON_CLASS="ZenExitButton"
+
+mkdir -p "$STATE"
+
+# ---------------------------------------------------------------- state ----
+# Everything zen changes is recorded here before it is changed, so --exit
+# restores exactly what was touched and nothing else. It also means a zen that
+# dies mid-session is recoverable: the file outlives the process, and a later
+# `zen --exit` still puts the night light timer back.
+
+save() { printf '%s=%s\n' "$1" "$2" >> "$SESSION"; }
+load() { grep -m1 "^$1=" "$SESSION" 2>/dev/null | cut -d= -f2- || true; }
+
+# ---------------------------------------------------------------- xfconf ----
+
+xfconf_get() {
+    xfconf-query -c "$1" -p "$2" 2>/dev/null || printf '%s\n' "$UNSET"
+}
+
+xfconf_set_bool() {
+    if [ "$(xfconf_get "$1" "$2")" = "$UNSET" ]; then
+        xfconf-query -c "$1" -p "$2" -n -t bool -s "$3" 2>/dev/null || true
+    else
+        xfconf-query -c "$1" -p "$2" -s "$3" 2>/dev/null || true
+    fi
+}
+
+# A property zen created itself is reset rather than set false, so zen leaves
+# no settings behind that were not there before.
+xfconf_restore() {
+    if [ "$3" = "$UNSET" ]; then
+        xfconf-query -c "$1" -p "$2" -r 2>/dev/null || true
+    else
+        xfconf-query -c "$1" -p "$2" -s "$3" 2>/dev/null || true
+    fi
+}
+
+# ----------------------------------------------------------------- procs ----
+
+ancestor_pids() {
+    local pid=$$ ppid
+    while [ "${pid:-0}" -gt 1 ] 2>/dev/null; do
+        printf '%s\n' "$pid"
+        ppid=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+        [ -n "$ppid" ] || break
+        pid=$ppid
+    done
+}
+
+# The exit button runs zen --exit, so it can be its own killer; skipping our
+# own ancestry stops --exit from cutting its legs off halfway through.
+#
+# The whole process group goes, not just the leader: these helpers are started
+# with setsid, so the button watcher is a group leader whose yad child would
+# otherwise be orphaned and left floating on top of the restored desktop.
+kill_unless_self() {
+    local pid=$1 a
+    [ -n "$pid" ] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    for a in $(ancestor_pids); do
+        [ "$a" = "$pid" ] && return 0
+    done
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+}
+
+# Start a helper detached and record the pid zen will later need to kill.
+#
+# $! is deliberately not used: setsid forks when the caller is already a
+# process group leader and execs in place when it is not, so $! names setsid
+# itself about half the time and the real session leader the rest. Killing the
+# wrong pid leaves the helper — and, for the button, its yad child — running on
+# top of the restored desktop. Having the child report its own $$ is exact, and
+# that pid doubles as its process group id.
+spawn_tracked() {
+    local key=$1; shift
+    local pidfile="$STATE/$key.pid" i
+    rm -f "$pidfile"
+    setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pidfile" "$@" \
+        >>"$LOG" 2>&1 </dev/null &
+    for i in $(seq 20); do
+        [ -s "$pidfile" ] && break
+        sleep 0.05
+    done
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    rm -f "$pidfile"
+    [ -n "$pid" ] && save "${key}_pid" "$pid"
+}
+
+# ------------------------------------------------------------ app config ----
+
+# A name is looked up in apps.conf first and treated as a bare command only if
+# no set matches, so `zen firefox` works with or without an entry.
+#
+# Only a bare identifier is looked up at all. Everything the picker produces is
+# a full command line — `steam steam://rungameid/504230`, `env LD_PRELOAD=...
+# markpad` — and those are matched literally by awk rather than fed to grep as
+# a pattern, where a `.` or `+` in a path would match things it should not.
+set_line() {
+    awk -v want="$1" '
+        index($0, "=") == 0 { next }
+        {
+            key = substr($0, 1, index($0, "=") - 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key == want) { print substr($0, index($0, "=") + 1); exit }
+        }' "$CONF" 2>/dev/null
+}
+
+resolve_apps() {
+    local name=$1 line=""
+    [[ $name =~ ^[A-Za-z0-9_.-]+$ ]] && line=$(set_line "$name")
+    if [ -n "$line" ]; then
+        local IFS='|' part
+        for part in $line; do
+            part=$(printf '%s' "$part" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -n "$part" ] && printf '%s\n' "$part"
+        done
+    else
+        printf '%s\n' "$name"
+    fi
+}
+
+# Set names in apps.conf, in file order.
+set_names() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        index($0, "=") == 0 { next }
+        {
+            key = substr($0, 1, index($0, "=") - 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key ~ /^[A-Za-z0-9_.-]+$/) print key
+        }' "$CONF" 2>/dev/null
+}
+
+screen_size() {
+    xrandr --query 2>/dev/null | awk '
+        / connected/ {
+            if (match($0, /[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/)) {
+                split(substr($0, RSTART, RLENGTH), a, /[x+]/)
+                print a[1], a[2]
+                exit
+            }
+        }'
+}
+
+# ------------------------------------------------------------------ enter ----
+
+do_enter() {
+    local -a apps=("$@")
+
+    if [ -f "$SESSION" ]; then
+        echo "zen: already active (started $(load started)). Run 'zen --exit' first." >&2
+        exit 1
+    fi
+
+    local -a commands=()
+    local name cmd
+    for name in "${apps[@]}"; do
+        while IFS= read -r cmd; do
+            [ -n "$cmd" ] && commands+=("$cmd")
+        done < <(resolve_apps "$name")
+    done
+
+    if [ ${#commands[@]} -eq 0 ]; then
+        echo "zen: nothing to launch" >&2
+        exit 1
+    fi
+
+    # Windows belonging to the terminal zen was started from are excluded from
+    # the preview, because by the time anything is closed zen has re-execed
+    # detached and that terminal is fair game like everything else.
+    local -a keep=()
+    local p
+    for p in $(ancestor_pids); do keep+=(--keep-pid "$p"); done
+
+    local open
+    open=$("$WM" list "${keep[@]}" 2>/dev/null)
+
+    if [ "${ZEN_DRY_RUN:-0}" = 1 ]; then
+        echo "zen: would launch:"
+        printf '  %s\n' "${commands[@]}"
+        echo "zen: would close these windows:"
+        if [ -n "$open" ]; then
+            printf '%s\n' "$open" | awk -F'\t' '{printf "  %s — %s\n", $2, $3}'
+        else
+            echo "  (none)"
+        fi
+        echo "zen: would stop: xfce4-panel, xfdesktop, notifications,"
+        echo "                 nightlight-auto.timer, screensaver/DPMS, tumblerd"
+        echo "zen: would NOT touch: xfsettingsd, xfwm4, pipewire, dbus, polkit,"
+        echo "                      redshift/gamma, backlight, system services"
+        exit 0
+    fi
+
+    # Confirmation happens before detaching so a terminal run can answer on the
+    # terminal; a hotkey run has no tty and gets the dialog instead.
+    if [ "${ZEN_YES:-0}" != 1 ] && [ -n "$open" ]; then
+        local pretty count
+        pretty=$(printf '%s\n' "$open" | awk -F'\t' '{printf "  • %s — %s\n", $2, $3}')
+        count=$(printf '%s\n' "$open" | wc -l)
+        if [ -t 0 ]; then
+            printf 'zen will close %s open window(s):\n%s\n' "$count" "$pretty"
+            read -r -p "Close them and enter zen? [y/N] " reply
+            [[ $reply =~ ^[Yy] ]] || { echo "zen: cancelled"; exit 0; }
+        else
+            yad --title="Zen mode" --center --on-top --width=460 \
+                --image=dialog-warning \
+                --text=$'zen will close these '"$count"$' window(s):\n\n'"$pretty"$'\nUnsaved work will prompt to save.' \
+                --button="Cancel:1" --button="Close them and enter zen:0" >/dev/null 2>&1 \
+                || { echo "zen: cancelled"; exit 0; }
+        fi
+    fi
+
+    # Re-exec detached: once the terminal zen was launched from is itself
+    # closed a moment from now, an attached zen would take the SIGHUP with it.
+    if [ "${ZEN_DETACHED:-0}" != 1 ]; then
+        ZEN_DETACHED=1 ZEN_YES=1 setsid nohup "$SELF" "${apps[@]}" \
+            >>"$LOG" 2>&1 </dev/null &
+        exit 0
+    fi
+
+    printf -- '--- zen enter %s ---\n' "$(date '+%F %T')"
+    : > "$SESSION"
+    save started "$(date '+%F %T')"
+
+    # --- freeze the screen ------------------------------------------------
+    # nightlight-auto.timer is the only thing here that rewrites gamma on a
+    # schedule (every 5 min). Stopping the timer rather than using nightlight's
+    # own `--mode manual` keeps the user's mode preference untouched and leaves
+    # nothing persistent behind if zen dies.
+    if systemctl --user is-active --quiet nightlight-auto.timer; then
+        systemctl --user stop nightlight-auto.timer
+        save nightlight_timer 1
+        echo "zen: night light automation paused (current warmth held)"
+    fi
+
+    # Presentation mode is XFCE's own inhibit for idle-dim, blank and DPMS. It
+    # is used instead of `xset s off -dpms` because xorg-xset is not installed,
+    # and it avoids touching brightness at all.
+    save presentation "$(xfconf_get xfce4-power-manager /xfce4-power-manager/presentation-mode)"
+    xfconf_set_bool xfce4-power-manager /xfce4-power-manager/presentation-mode true
+
+    # Belt and braces: the screensaver has its own inhibit path, and the
+    # command holds the inhibit for as long as it stays alive.
+    if command -v xfce4-screensaver-command >/dev/null 2>&1; then
+        spawn_tracked inhibit xfce4-screensaver-command --inhibit \
+            --application-name zen --reason "zen mode"
+    fi
+
+    # --- strip the desktop ------------------------------------------------
+    save notifyd_dnd "$(xfconf_get xfce4-notifyd /do-not-disturb)"
+    xfconf_set_bool xfce4-notifyd /do-not-disturb true
+
+    if pgrep -u "$USER" -x xfce4-panel >/dev/null 2>&1; then
+        # Takes every tray plugin with it: clipman, nm-applet, blueman, and the
+        # brightness tray. The brightness tray's 2s poll is read-only, so losing
+        # it changes nothing on screen.
+        xfce4-panel --quit >/dev/null 2>&1 || true
+        save panel 1
+    fi
+
+    if pgrep -u "$USER" -x xfdesktop >/dev/null 2>&1; then
+        xfdesktop --quit >/dev/null 2>&1 || true
+        save xfdesktop 1
+    fi
+
+    if systemctl --user is-active --quiet tumblerd.service; then
+        systemctl --user stop tumblerd.service 2>/dev/null || true
+        save tumblerd 1
+    fi
+
+    # One workspace for the duration, so there is nowhere to wander off to.
+    local ws
+    ws=$(xfconf-query -c xfwm4 -p /general/workspace_count 2>/dev/null || echo "$UNSET")
+    if [ "$ws" != "$UNSET" ] && [ "$ws" != 1 ]; then
+        save workspaces "$ws"
+        xfconf-query -c xfwm4 -p /general/workspace_count -s 1 2>/dev/null || true
+    fi
+
+    # --- close everything -------------------------------------------------
+    local survivors
+    survivors=$("$WM" close-all --timeout 8 2>/dev/null)
+    if [ -n "$survivors" ]; then
+        # Left running on purpose: a window still up after a polite close is
+        # usually an unsaved-work prompt, and killing it is how you lose the file.
+        echo "zen: still open (likely asking to save):"
+        printf '%s\n' "$survivors" | awk -F'\t' '{printf "  %s — %s\n", $2, $3}'
+    fi
+
+    # --- launch -----------------------------------------------------------
+    # The watcher starts first so its "windows that exist right now" baseline
+    # is taken before any app has had a chance to map a window.
+    spawn_tracked fullscreen "$WM" fullscreen-new \
+        --timeout 40 --expect "${#commands[@]}" --skip-class "$BUTTON_CLASS"
+    sleep 0.4
+
+    for cmd in "${commands[@]}"; do
+        echo "zen: launching $cmd"
+        setsid bash -c "$cmd" >>"$LOG" 2>&1 </dev/null &
+    done
+
+    # --- exit affordance --------------------------------------------------
+    spawn_tracked button "$SELF" --button-watch
+
+    echo "zen: active"
+}
+
+# ----------------------------------------------------------------- button ----
+
+# Fullscreen windows sit above the always-on-top layer in xfwm4, so this button
+# is reachable once the app is minimised — which is the agreed way out. <Super>Z
+# works without minimising anything.
+#
+# zen-button.py rather than yad: yad can only draw a *dialog*, so the smallest
+# possible "one button" still came with a content area and a button box around
+# it. There the window is the button and nothing else.
+do_button_watch() {
+    if "$BUTTON" >/dev/null 2>&1; then
+        exec "$SELF" --exit
+    fi
+}
+
+# ------------------------------------------------------------------- pick ----
+
+# The counterpart to the exit button: entering zen from a hotkey instead of a
+# terminal, which matters because the terminal you would have typed into is one
+# of the windows zen is about to close. It offers every installed application,
+# not just the sets in apps.conf — a set is a shortcut for a combination worth
+# naming, not the limit of what zen can open.
+picker_rows() {
+    local name value
+    while IFS= read -r name; do
+        value=$(set_line "$name")
+        value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        printf 'set\t%s\tset: %s\t%s\n' "$name" "$value" "$name"
+    done < <(set_names)
+
+    # The token for an app is its full command, which resolve_apps passes
+    # through untouched because it is not a bare identifier.
+    "$APPS_LIST" 2>/dev/null | awk -F'\t' 'NF >= 2 { printf "app\t%s\t%s\t%s\n", $1, $2, $2 }'
+}
+
+do_pick() {
+    local rows choices line
+    rows=$(picker_rows)
+    if [ -z "$rows" ]; then
+        yad --title="Zen" --center --on-top --button=OK:0 \
+            --text="No app sets in $CONF and no .desktop files found." \
+            >/dev/null 2>&1
+        exit 1
+    fi
+
+    # Cancelled, or closed without choosing: exit quietly rather than entering
+    # zen with nothing, which would leave a stripped desktop and no app.
+    choices=$(printf '%s\n' "$rows" | "$PICKER") || exit 0
+    [ -n "$choices" ] || exit 0
+
+    local -a apps=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && apps+=("$line")
+    done <<< "$choices"
+
+    [ ${#apps[@]} -gt 0 ] && exec "$SELF" "${apps[@]}"
+    exit 0
+}
+
+# ------------------------------------------------------------------- exit ----
+
+do_exit() {
+    if [ ! -f "$SESSION" ]; then
+        echo "zen: not active"
+        exit 0
+    fi
+
+    printf -- '--- zen exit %s ---\n' "$(date '+%F %T')"
+
+    # Read the whole session up front. The panel and desktop are restarted in
+    # the background, and a backgrounded `load` could otherwise run after the
+    # session file is deleted below, silently leaving the desktop with no panel.
+    local btn fs inh ws tumbler desktop panel dnd presentation nightlight
+    btn=$(load button_pid);      fs=$(load fullscreen_pid)
+    inh=$(load inhibit_pid);     ws=$(load workspaces)
+    tumbler=$(load tumblerd);    desktop=$(load xfdesktop)
+    panel=$(load panel);         dnd=$(load notifyd_dnd)
+    presentation=$(load presentation)
+    nightlight=$(load nightlight_timer)
+
+    kill_unless_self "$btn"
+    kill_unless_self "$fs"
+    kill_unless_self "$inh"
+
+    # Windows come out of fullscreen but are left running: closing the app you
+    # just spent an hour in would be a rude way to end a focus session.
+    "$WM" unfullscreen-all >/dev/null 2>&1 || true
+
+    [ -n "$ws" ] && xfconf-query -c xfwm4 -p /general/workspace_count -s "$ws" 2>/dev/null
+
+    [ "$tumbler" = 1 ] && systemctl --user start tumblerd.service 2>/dev/null
+
+    [ "$desktop" = 1 ] && { setsid xfdesktop >/dev/null 2>&1 </dev/null & }
+    [ "$panel" = 1 ] && { setsid xfce4-panel >/dev/null 2>&1 </dev/null & }
+
+    xfconf_restore xfce4-notifyd /do-not-disturb "$dnd"
+    xfconf_restore xfce4-power-manager /xfce4-power-manager/presentation-mode "$presentation"
+
+    if [ "$nightlight" = 1 ]; then
+        systemctl --user start nightlight-auto.timer 2>/dev/null
+        # The timer's Persistent=true would catch up on its own, but firing the
+        # service directly means the screen is back to the right warmth for the
+        # current time immediately, instead of up to five minutes late.
+        systemctl --user start nightlight-auto.service 2>/dev/null
+        echo "zen: night light automation resumed"
+    fi
+
+    rm -f "$SESSION"
+    echo "zen: exited"
+}
+
+# ----------------------------------------------------------------- status ----
+
+do_status() {
+    if [ ! -f "$SESSION" ]; then
+        echo "zen: not active"
+        exit 0
+    fi
+    echo "zen: active since $(load started)"
+    echo "changed:"
+    [ "$(load nightlight_timer)" = 1 ] && echo "  night light automation stopped (warmth frozen)"
+    [ "$(load panel)" = 1 ]            && echo "  xfce4-panel quit"
+    [ "$(load xfdesktop)" = 1 ]        && echo "  xfdesktop quit"
+    [ "$(load tumblerd)" = 1 ]         && echo "  tumblerd stopped"
+    [ -n "$(load workspaces)" ]        && echo "  workspaces $(load workspaces) -> 1"
+    echo "  notifications: do-not-disturb"
+    echo "  screensaver/DPMS inhibited"
+    exit 0
+}
+
+# ------------------------------------------------------------------- main ----
+
+for helper in "$WM" "$APPS_LIST" "$PICKER" "$BUTTON"; do
+    [ -x "$helper" ] || { echo "zen: missing or not executable: $helper" >&2; exit 1; }
+done
+
+usage() { sed -n '2,25p' "$SELF" | sed 's/^# \?//'; }
+
+declare -a APPS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --exit|-e)      do_exit; exit 0 ;;
+        --status|-s)    do_status ;;
+        --pick|-p)      do_pick; exit 0 ;;
+        --apps)         "$APPS_LIST"; exit $? ;;
+        --button-watch) do_button_watch; exit 0 ;;
+        --dry-run|-n)   export ZEN_DRY_RUN=1 ;;
+        --yes|-y)       export ZEN_YES=1 ;;
+        -h|--help)      usage; exit 0 ;;
+        -*)             echo "zen: unknown option $1" >&2; exit 1 ;;
+        *)              APPS+=("$1") ;;
+    esac
+    shift
+done
+
+if [ ${#APPS[@]} -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+do_enter "${APPS[@]}"

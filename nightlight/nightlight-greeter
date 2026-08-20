@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# nightlight-greeter <user> [path/to/nightlight-auto] — the night light at the
+# login screen, so the greeter is already warm before anyone types a password.
+#
+# LightDM runs this as root, twice per X server, from
+# /etc/lightdm/lightdm.conf.d/50-nightlight.conf:
+#
+#   display-setup-script   as soon as the X server is up, before the greeter draws
+#   greeter-setup-script   once the greeter is up, in case its own display pass
+#                          reconfigured the CRTC and wiped the ramp on the way in
+#
+# That is the same "apply twice" this repo already needs at session start, but
+# both hooks block what comes after them, so this stays two quick redshift calls
+# with no sleep in between — nightlight-login can afford to wait for xfsettingsd
+# because by then the session is already on screen, and this cannot.
+#
+# The session takes over the greeter's X server rather than starting its own, so
+# the ramp set here survives the login and stays until nightlight-login re-asserts it.
+#
+# Installed to /usr/local/libexec by install-nightlight-greeter.sh. A copy rather
+# than a reference on purpose: LightDM runs this as root before anyone has
+# authenticated, and pointing that at a script under $HOME would hand root to
+# anything able to write there.
+set -u
+
+# Absolute paths throughout: this runs as root out of LightDM, whose PATH is
+# whatever systemd handed the display manager.
+REDSHIFT=/usr/bin/redshift
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+SETPRIV=/usr/bin/setpriv
+
+USER_NAME=${1:-}
+AUTO=${2:-}
+
+# LightDM runs these hooks for every seat it brings up, including ones with no X
+# server to set a gamma ramp on. Nothing to do there.
+[ -n "${DISPLAY:-}" ] || exit 0
+[ -n "$USER_NAME" ] || exit 0
+[ -x "$REDSHIFT" ] || exit 0
+
+passwd_line=$($GETENT passwd "$USER_NAME") || exit 0
+IFS=: read -r _ _ uid gid _ home_dir _ <<<"$passwd_line"
+[ -n "$home_dir" ] || exit 0
+
+# Ask the schedule what it wants, as the account that owns it — nightlight-auto
+# reads that user's mode and override state out of their $HOME.
+#
+# Dropping privileges for the question is the whole design: root never executes a
+# line of $HOME, and what comes back is a number that gets re-checked below, so
+# the worst a tampered nightlight-auto can do is choose the colour of the login
+# screen. setpriv rather than runuser because runuser's PAM stack pulls in
+# system-login, which would register a logind session for a user who has not
+# logged in yet; this needs a uid change and nothing else.
+pct=""
+if [ -n "$AUTO" ] && [ -x "$AUTO" ]; then
+    pct=$($SETPRIV --reuid "$uid" --regid "$gid" --init-groups --inh-caps=-all -- \
+              /usr/bin/env -i HOME="$home_dir" PATH=/usr/local/bin:/usr/bin \
+              "$AUTO" --print 2>/dev/null)
+fi
+
+# No usable answer — repo moved, script deleted, garbage on stdout — so fall back
+# to the temperature sitting in the config, i.e. whatever was last applied. It
+# can be a session stale, but it is far closer than the neutral ramp X starts
+# with, and it means moving this folder dims the login screen's accuracy instead
+# of breaking it.
+if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -gt 100 ]; then
+    temp=$($GREP -oP '(?<=^temp-day=)\d+' "$home_dir/.config/redshift/redshift.conf" 2>/dev/null)
+    [[ "$temp" =~ ^[0-9]+$ ]] || exit 0
+    pct=$(( (6500 - temp) / 40 ))
+    { [ "$pct" -ge 0 ] && [ "$pct" -le 100 ]; } || exit 0
+fi
+
+temp=$((6500 - pct * 40))
+
+# -P for the reason nightlight documents: without it redshift stacks each
+# adjustment on the last, and the second hook would leave the screen redder than
+# the first asked for.
+"$REDSHIFT" -P -O "$temp" >/dev/null 2>&1 || true
+
+# Always succeed. A failed setup script is LightDM's problem to log, and a login
+# screen that will not come up because the colour was wrong is a bad trade.
+exit 0

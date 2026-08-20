@@ -1,0 +1,1160 @@
+#!/usr/bin/env python3
+"""OOM Defender — stop the memory hog before it stops the machine.
+
+On a 3.4 GB laptop the kernel's own OOM killer is too late to be much use: by
+the time it fires, the machine has already spent half a minute thrashing and
+the desktop stopped repainting. This daemon watches memory itself and acts
+while there is still room to act in.
+
+Two tiers, because the cheap response should come first:
+
+  freeze  The biggest memory hog gets SIGSTOP. It stops executing, so it stops
+          allocating, and the kernel gets to reclaim without racing a process
+          that is still growing. Nothing is lost — if memory recovers the
+          process is resumed with SIGCONT and the whole episode cost a stutter.
+
+  kill    If freezing bought no recovery within `freeze_grace` seconds, or if
+          memory falls off a cliff outright, the hog gets SIGKILL. The victim
+          is re-picked at that moment rather than inherited from the freeze:
+          the process worth freezing 20 seconds ago is not always the one
+          holding the machine down now.
+
+Both tiers raise a desktop notification. A process that silently freezes or
+vanishes is worse than one you were told about, and "the defender had to step
+in" is exactly the thing you want to know before you go looking for the tab
+that disappeared.
+
+WHO GETS PICKED. The biggest process is the wrong answer. If you are watching
+a video with twenty idle tabs behind it, the video is very likely the largest
+thing on the machine, and freezing it to save the tabs nobody is looking at
+gets the trade exactly backwards. Candidates are therefore ordered by three
+keys, in this order:
+
+  attention  Whether the process belongs to the window you are focused on.
+             The focused window's PID comes from the window manager; the group
+             around it is grown down through its children and up through its
+             parents, stopping at the first protected process. That is what
+             keeps a browser's content children with the browser without the
+             walk escaping into xfce4-session and protecting the whole desktop.
+  in use     Within a group, something burning CPU without growing is doing
+             work you can see or hear. Something burning CPU *and* growing is
+             the runaway, and stays a candidate.
+  size       Projected a few seconds forward rather than measured now, so a
+             process allocating 40 MB/s outranks one that has been sitting on
+             400 MB all afternoon.
+
+The result is that the first thing frozen is the biggest idle process you are
+not looking at, and the app in front of you is reached only when nothing else
+is left. Freezing is also allowed to happen more than once: several idle
+processes suspended in sequence is a gentler way out than one big kill.
+
+Killing orders the same candidates differently, because the two acts cost
+different things. A freeze is reversible and costs a stutter, so it should
+always be spent on something you are not using, however small. A kill throws
+work away, so it has to be spent on something big enough to actually end the
+episode — there is no sense destroying a 400 MB background job to rescue a
+machine being held down by a 2 GB one. Focus is therefore a bias when killing
+rather than an absolute: a process belonging to the app you are in is passed
+over while something unfocused is within reach of the same size, and chosen
+once nothing else can plausibly help.
+
+TRIGGERS. Two independent paths, because with a large swapfile the two ways a
+machine dies look nothing alike:
+
+  exhaustion  Free memory *and* free swap are both nearly gone. The classic
+              earlyoom condition — a genuine allocation wall is coming.
+  thrashing   The memory PSI "full" figure stays high — every task is stalled
+              waiting on paging. Plenty of swap may remain; the machine is
+              still unusable, and with 19 GB of swap this is how you actually
+              lose an afternoon.
+
+SAFETY. Nothing in `protect` is ever a victim, nor is anything with an
+oom_score_adj at or below -900 (which includes this daemon). Victims are
+identified by PID *and* start time, so a recycled PID can never be signalled by
+mistake. Every frozen process is resumed if the daemon exits for any reason —
+a leftover SIGSTOP would look exactly like a hung app.
+
+Config lives in /etc/oom-defender.conf (key = value, '#' comments); SIGHUP
+reloads it. Run with --status to see where you stand right now, --dry-run to
+watch it decide without signalling anything, --test-notify to check the
+notification path reaches your desktop.
+"""
+
+import ctypes
+import os
+import pwd
+import select
+import signal
+import sys
+import time
+
+CONFIG_PATH = "/etc/oom-defender.conf"
+
+# Percentages are of MemTotal / SwapTotal; seconds are seconds.
+DEFAULTS = {
+    # Tier 1 — freeze. Both conditions must hold for the exhaustion path.
+    "freeze_mem_pct": 10.0,
+    "freeze_swap_pct": 25.0,
+    # Tier 2 — kill.
+    "kill_mem_pct": 5.0,
+    "kill_swap_pct": 12.0,
+    # The thrashing path: memory PSI "full avg10", held for this many seconds.
+    # avg10 is already a 10-second average, so the hold is a second filter
+    # against a single burst of paging (opening a big file, waking from idle).
+    "freeze_psi": 15.0,
+    "freeze_psi_secs": 10.0,
+    "kill_psi": 40.0,
+    "kill_psi_secs": 20.0,
+    # Resume frozen processes once memory is back above this and paging has
+    # calmed down. Deliberately well above freeze_mem_pct: releasing at the
+    # threshold we froze at just re-freezes a second later.
+    "release_mem_pct": 20.0,
+    # How long a freeze is given to produce a recovery before we escalate.
+    "freeze_grace": 20.0,
+    # A freeze is meant to be a stutter, not a sentence. Memory here can sit
+    # between freeze_mem_pct and release_mem_pct for a very long time — on
+    # 2026-08-11 that gap kept a browser process suspended for eleven minutes,
+    # because nothing was firing any more but nothing had recovered enough to
+    # release it either. Past this many seconds, with nothing currently
+    # triggering, let it go: a second stutter later costs far less than a hang
+    # the user is sitting in front of.
+    "freeze_max_secs": 90.0,
+    # After a kill, don't kill again for this long. PSI averages lag reality by
+    # several seconds, so without this one runaway costs you three processes.
+    "kill_cooldown": 10.0,
+    # Prefer victims outside the focused window's process group. 0 turns the
+    # whole idea off and ranks purely by size, the way this started out.
+    "focus_aware": 1,
+    # How often to ask the window manager what is focused. Focus does not
+    # change on the timescale that matters here, and the answer is cached, so
+    # this is cheap even at the tightest polling interval.
+    "focus_poll": 2.0,
+    # Freezing one process rarely ends an episode on its own. Up to this many
+    # may be suspended, one every freeze_interval seconds, before the grace
+    # period runs out and something gets killed instead.
+    "max_frozen": 4.0,
+    "freeze_interval": 3.0,
+    # Rank on the size a process is heading for, this many seconds ahead, so a
+    # runaway is picked while it is still small enough to be worth freezing.
+    "growth_lookahead": 10.0,
+    # Growing faster than this (kB/s) means "still allocating", which keeps a
+    # busy process a candidate instead of reading as in-use.
+    "growth_min_kb": 512.0,
+    # CPU percent (of one core) above which a process counts as in use.
+    "busy_cpu_pct": 8.0,
+    # How much bigger a process belonging to the focused app has to be before
+    # it is killed in preference to something you are not using. 3 means four
+    # times the size; 0 removes the protection at the kill tier entirely.
+    "kill_focus_bias": 3.0,
+    # Minimum gap between full /proc sweeps. The tick rate rises to 10 Hz under
+    # pressure; re-walking every process that often would make the watchdog a
+    # noticeable load in its own right, and rates need a window to be measured
+    # over anyway.
+    "scan_interval": 0.5,
+    # Never touch a process smaller than this, whatever it scores. Two dozen
+    # D-Bus session services on this box ship with oom_score_adj=200 while
+    # being 3-8 MB each, which the kernel's own formula ranks above a 500 MB
+    # browser. Freeing 5 MB does not end an OOM; it just breaks the trash icon
+    # and leaves the actual hog running.
+    "min_victim_mb": 96.0,
+    # comm names, comma separated. Compared on the first 15 characters because
+    # that is all the kernel keeps, so long names match without being spelled
+    # out in their truncated form.
+    "protect": (
+        "systemd,systemd-journald,systemd-logind,systemd-udevd,systemd-resolved,"
+        "systemd-timesyncd,systemd-userdbd,systemd-oomd,init,"
+        "dbus-broker,dbus-broker-launch,dbus-daemon,polkitd,accounts-daemon,"
+        "NetworkManager,wpa_supplicant,bluetoothd,sshd,agetty,login,"
+        "Xorg,lightdm,xfce4-session,xfwm4,xfsettingsd,xfce4-panel,xfdesktop,"
+        "xfconfd,xfce4-notifyd,xfce4-power-manager,"
+        "pipewire,pipewire-pulse,wireplumber,pulseaudio,upowerd,udisksd,"
+        "oom-defender"
+    ),
+    "dry_run": 0,
+}
+
+NOTIFY_SEND = "/usr/bin/notify-send"
+XPROP = "/usr/bin/xprop"
+PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
+CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
+
+
+def log(msg):
+    """Journal, via stdout — systemd captures it."""
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+def load_config(path=CONFIG_PATH):
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return cfg
+    except OSError as exc:
+        log(f"config: cannot read {path}: {exc} — using defaults")
+        return cfg
+
+    for n, raw in enumerate(lines, 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            log(f"config: {path}:{n}: no '=', ignored")
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key not in DEFAULTS:
+            log(f"config: {path}:{n}: unknown key {key!r}, ignored")
+            continue
+        if isinstance(DEFAULTS[key], str):
+            cfg[key] = value
+        else:
+            try:
+                cfg[key] = float(value)
+            except ValueError:
+                log(f"config: {path}:{n}: {key} wants a number, got {value!r}")
+    return cfg
+
+
+def protected_names(cfg):
+    # The kernel truncates comm to 15 characters (TASK_COMM_LEN - 1), so both
+    # sides get truncated and long names in the config still match.
+    return {name.strip()[:15] for name in cfg["protect"].split(",") if name.strip()}
+
+
+# --------------------------------------------------------------------------
+# Reading the machine
+# --------------------------------------------------------------------------
+
+class Mem:
+    __slots__ = ("total", "avail", "swap_total", "swap_free")
+
+    @property
+    def mem_pct(self):
+        return 100.0 * self.avail / self.total if self.total else 100.0
+
+    @property
+    def swap_pct(self):
+        # No swap at all is not "0% free" — it is "swap is not the problem".
+        return 100.0 * self.swap_free / self.swap_total if self.swap_total else 100.0
+
+
+def read_meminfo():
+    m = Mem()
+    m.total = m.avail = m.swap_total = m.swap_free = 0
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            key, _, rest = line.partition(":")
+            if key == "MemTotal":
+                m.total = int(rest.split()[0])
+            elif key == "MemAvailable":
+                m.avail = int(rest.split()[0])
+            elif key == "SwapTotal":
+                m.swap_total = int(rest.split()[0])
+            elif key == "SwapFree":
+                m.swap_free = int(rest.split()[0])
+                break  # SwapFree is the last field we need
+    return m
+
+
+_psi_warned = False
+
+
+def read_psi_full_avg10():
+    """Percent of the last 10s in which *every* task was stalled on memory."""
+    global _psi_warned
+    try:
+        with open("/proc/pressure/memory") as fh:
+            for line in fh:
+                if line.startswith("full"):
+                    for field in line.split()[1:]:
+                        if field.startswith("avg10="):
+                            return float(field[6:])
+    except OSError:
+        if not _psi_warned:
+            _psi_warned = True
+            log("PSI unavailable (/proc/pressure/memory) — thrash detection off, "
+                "exhaustion thresholds still apply")
+    return 0.0
+
+
+class Victim:
+    __slots__ = ("pid", "name", "kb", "points", "start", "frozen_at",
+                 "tier", "busy", "growth", "cpu")
+
+    def __init__(self, pid, name, kb, points, start):
+        self.pid = pid
+        self.name = name
+        self.kb = kb
+        self.points = points
+        self.start = start
+        self.frozen_at = 0.0
+        self.tier = 0      # 0 unfocused, 1 focused app's group, 2 the window itself
+        self.busy = 0      # 1 when it looks like it is doing work for you
+        self.growth = 0.0  # kB/s
+        self.cpu = 0.0     # percent of one core
+
+    def __str__(self):
+        return f"{self.name}[{self.pid}] {self.kb / 1024:.0f} MB"
+
+    def why(self):
+        """The one-line reason this was the process picked."""
+        if self.tier == 2:
+            return "it is the window in front of you and nothing else was left"
+        if self.tier == 1:
+            return "it belongs to the app you are using, but nothing else was left"
+        if self.growth > 0:
+            return f"it is idle, unfocused and still growing ({self.growth / 1024:.0f} MB/s)"
+        return "it is the largest thing you are not using"
+
+    def alive(self):
+        """Still the same process, and still holding memory.
+
+        A zombie counts as dead here: its pages are already gone, only the
+        exit status is left. Treating one as alive would leave a corpse in the
+        frozen list and make the post-kill wait sit out its full timeout while
+        the machine is still short of memory.
+        """
+        state, start, _ = read_stat_identity(self.pid)
+        return start == self.start and state != "Z"
+
+
+def read_stat_identity(pid):
+    """(state, start time, cpu ticks) from /proc/pid/stat.
+
+    Start time is what makes a victim identifiable: PIDs get recycled, and a
+    stale one plus a SIGKILL is how a watchdog kills the wrong process. comm
+    sits in field 2 and may contain spaces and parentheses, so the split has
+    to start after the last ')' — which also means every index below is the
+    documented field number minus three.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            data = fh.read()
+    except OSError:
+        return None, None, 0
+    close = data.rfind(")")
+    if close < 0:
+        return None, None, 0
+    fields = data[close + 2:].split()
+    try:
+        # state (3), starttime (22), utime + stime (14, 15)
+        return fields[0], fields[19], int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None, None, 0
+
+
+def read_starttime(pid):
+    return read_stat_identity(pid)[1]
+
+
+class Tracker:
+    """How each process is changing, sampled from one sweep to the next.
+
+    Size alone cannot tell a runaway from a large well-behaved program, and it
+    cannot tell a video decoding from a tab that has been parked all morning.
+    Two rates do: kB gained per second, and CPU burned per second.
+    """
+
+    __slots__ = ("prev",)
+
+    def __init__(self):
+        self.prev = {}  # (pid, start) -> (when, kb, ticks, growth, cpu)
+
+    def update(self, key, now, kb, ticks):
+        last = self.prev.get(key)
+        if last is None:
+            self.prev[key] = (now, kb, ticks, 0.0, 0.0)
+            return 0.0, 0.0
+        dt = now - last[0]
+        if dt < 0.5:
+            # Too short a window to divide by; keep the previous answer rather
+            # than manufacture a noisy one.
+            return last[3], last[4]
+        growth = (kb - last[1]) / dt
+        cpu = 100.0 * (ticks - last[2]) / (CLOCK_TICKS * dt)
+        self.prev[key] = (now, kb, ticks, growth, cpu)
+        return growth, cpu
+
+    def prune(self, live):
+        if len(self.prev) > len(live):
+            for key in [k for k in self.prev if k not in live]:
+                del self.prev[key]
+
+
+def scan_processes():
+    """One walk over /proc.
+
+    Returns (sized, ppid_of, comm_of). `sized` carries only processes with
+    resident memory, which is what can be a victim; the two maps cover every
+    process, because the parent of the window you are looking at may itself be
+    tiny and still matter for working out which app it belongs to.
+    """
+    sized = []
+    ppid_of = {}
+    comm_of = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid <= 1:
+            continue
+        comm = None
+        ppid = 0
+        rss = swap = 0
+        try:
+            with open(f"/proc/{pid}/status") as fh:
+                for line in fh:
+                    key, _, rest = line.partition(":")
+                    if key == "Name":
+                        comm = rest.strip()
+                    elif key == "PPid":
+                        ppid = int(rest)
+                    elif key == "VmRSS":
+                        rss = int(rest.split()[0])
+                    elif key == "VmSwap":
+                        swap = int(rest.split()[0])
+                        break  # VmSwap is the last field we need
+        except (OSError, ValueError):
+            continue  # exited mid-read; nothing to protect it from any more
+        if comm is None:
+            continue
+        comm_of[pid] = comm
+        ppid_of[pid] = ppid
+        if rss:  # kernel threads have none, and are not ours to signal
+            sized.append((pid, comm, rss + swap))
+    return sized, ppid_of, comm_of
+
+
+def rank_victims(sized, mem, protect, cfg, attention, tracker, now):
+    """Every eligible process, worst first.
+
+    Size follows the kernel's own badness — resident plus swapped pages as a
+    share of RAM, with oom_score_adj added on the same 0..1000 scale, so the
+    usual `choom` tuning still applies — but it is only the last of three sort
+    keys. Attention comes first and being visibly in use comes second, because
+    the largest process and the one worth freezing are usually not the same
+    process. See min_victim_mb for why the size floor is not optional.
+    """
+    min_victim_kb = cfg["min_victim_mb"] * 1024
+    lookahead = cfg["growth_lookahead"]
+    growth_min = cfg["growth_min_kb"]
+    busy_pct = cfg["busy_cpu_pct"]
+
+    victims = []
+    live = set()
+    for pid, comm, kb in sized:
+        if comm[:15] in protect or kb < min_victim_kb:
+            continue
+        try:
+            with open(f"/proc/{pid}/oom_score_adj") as fh:
+                adj = int(fh.read())
+        except (OSError, ValueError):
+            continue
+        if adj <= -900:
+            continue  # opted out, and that includes us
+        state, start, ticks = read_stat_identity(pid)
+        if start is None or state == "Z":
+            continue
+
+        key = (pid, start)
+        live.add(key)
+        growth, cpu = tracker.update(key, now, kb, ticks)
+
+        # Score the size it is heading for rather than the size it has. A
+        # process taking 40 MB/s is the reason the machine is in trouble; one
+        # that has held 400 MB since this morning is merely large, and freezing
+        # it buys nothing that was not already bought.
+        projected = kb + max(0.0, growth) * lookahead
+        victim = Victim(pid, comm, kb, 1000.0 * projected / mem.total + adj, start)
+        victim.growth = growth
+        victim.cpu = cpu
+        victim.tier = (2 if pid == attention.pid
+                       else 1 if pid in attention.group
+                       else 0)
+        # Burning CPU without growing is what being used looks like: a video
+        # decoding, a build running, music playing. Burning CPU *and* growing
+        # is the runaway itself, which is precisely what we came for.
+        victim.busy = 1 if cpu >= busy_pct and growth <= growth_min else 0
+        victims.append(victim)
+
+    tracker.prune(live)
+    victims.sort(key=lambda v: (v.tier, v.busy, -v.points))
+    return victims
+
+
+def kill_order(victims, cfg):
+    """The same candidates, ordered for a kill rather than for a freeze.
+
+    Freezing is reversible, so it is always worth spending on something the
+    user is not using, however small it is. Killing is not, so it has to land
+    on something big enough to end the episode — freeing 400 MB from a
+    background job does nothing for a machine being held down by 2 GB
+    somewhere else, and the background job is gone either way. Focus becomes a
+    bias here instead of an absolute: with the default of 3, a process in the
+    focused app has to be four times the size before it is preferred.
+    """
+    bias = cfg["kill_focus_bias"]
+    return sorted(victims, key=lambda v: -v.points / (1.0 + bias * v.tier))
+
+
+# --------------------------------------------------------------------------
+# What the user is looking at
+# --------------------------------------------------------------------------
+
+def run_capture(argv, env, timeout=2.0, limit=4096):
+    """Run a command and return its stdout, without ever stalling the loop.
+
+    Not subprocess: the main loop leaves SIGCHLD as SIG_IGN so notify-send
+    children are reaped by the kernel, which is exactly the arrangement that
+    makes subprocess's own wait() unreliable. We want the output and nothing
+    else, so a pipe is the whole requirement.
+
+    The child arms alarm(), which survives execve, rather than the parent
+    killing it on timeout. That matters: after SIG_IGN reaping, a pid we time
+    out on may already have exited and been replaced, and signalling a
+    recycled pid is the one mistake this daemon is built not to make. A child
+    that puts itself down cannot be confused with anybody else.
+    """
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        return None
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        return None
+
+    if pid == 0:
+        try:
+            # Close the read end before any dup2, so a pipe that happened to
+            # land on fd 0 cannot be closed again after being replaced.
+            os.close(read_fd)
+            null = os.open(os.devnull, os.O_RDWR)
+            os.dup2(null, 0)
+            os.dup2(write_fd, 1)
+            os.dup2(null, 2)
+            signal.alarm(int(timeout) + 1)
+            os.execve(argv[0], argv, env)
+        except BaseException:
+            pass
+        os._exit(127)
+
+    os.close(write_fd)
+    chunks = []
+    size = 0
+    deadline = time.monotonic() + timeout
+    try:
+        while size < limit:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if not select.select([read_fd], [], [], left)[0]:
+                break
+            data = os.read(read_fd, 1024)
+            if not data:
+                break
+            chunks.append(data)
+            size += len(data)
+    except OSError:
+        pass
+    finally:
+        os.close(read_fd)
+    return b"".join(chunks).decode("utf-8", "replace") or None
+
+
+class Attention:
+    """The window the user is focused on, and the processes behind it.
+
+    X is the only authority on what has focus, so this asks the window manager
+    over the same session environment the notifications use. Everything about
+    it is best-effort: no X, no xprop, no _NET_WM_PID on the focused window,
+    and the group is simply empty, which returns victim choice to size alone.
+    """
+
+    __slots__ = ("cfg", "pid", "group", "checked", "warned")
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.pid = None
+        self.group = frozenset()
+        self.checked = 0.0
+        self.warned = False
+
+    def refresh(self, now, ppid_of, comm_of, protect):
+        if not self.cfg["focus_aware"]:
+            self.pid = None
+            self.group = frozenset()
+            return
+        if now - self.checked >= self.cfg["focus_poll"]:
+            self.checked = now
+            pid = self._focused_pid()
+            if pid is not None:
+                self.pid = pid
+        # Regroup every sweep even when focus itself was not re-read: a browser
+        # spawns and retires content processes constantly, and a group computed
+        # thirty seconds ago would not contain the tab you just opened.
+        self.group = self._group(ppid_of, comm_of, protect)
+
+    def _focused_pid(self):
+        session = find_session()
+        if session is None:
+            return None
+        env = dict(session[3])
+        env.setdefault("XAUTHORITY", os.path.join(env.get("HOME", "/"), ".Xauthority"))
+
+        # _NET_ACTIVE_WINDOW(WINDOW): window id # 0x3200017, 0x0
+        out = run_capture([XPROP, "-root", "_NET_ACTIVE_WINDOW"], env)
+        if not out:
+            if not self.warned:
+                self.warned = True
+                log(f"focus: {XPROP} gave nothing — ranking by size alone")
+            return None
+        window = out.rpartition("#")[2].strip().split(",")[0].strip()
+        if not window.startswith("0x"):
+            return None
+        try:
+            if int(window, 16) == 0:
+                return None  # nothing focused, e.g. the desktop itself
+        except ValueError:
+            return None
+
+        # _NET_WM_PID(CARDINAL) = 148256
+        out = run_capture([XPROP, "-id", window, "_NET_WM_PID"], env)
+        if not out or "=" not in out:
+            return None  # window sets no pid; nothing to be done about it
+        try:
+            return int(out.rpartition("=")[2].strip())
+        except ValueError:
+            return None
+
+    def _group(self, ppid_of, comm_of, protect):
+        """Every process belonging to the focused application.
+
+        Up first, to find the top of the application: the browser's parent is
+        xfce4-panel and *its* parent is the session, so an unbounded walk would
+        end up declaring the entire desktop off limits. Stopping at the first
+        protected process is exactly the right bound, because the protect list
+        is already the list of things that own the session rather than belong
+        to it. Then down, so a browser's content children are covered too.
+        """
+        pid = self.pid
+        if pid is None or pid not in ppid_of:
+            return frozenset()
+
+        root = pid
+        seen = {pid}
+        while True:
+            parent = ppid_of.get(root)
+            if parent is None or parent <= 1 or parent in seen:
+                break
+            if comm_of.get(parent, "")[:15] in protect:
+                break
+            seen.add(parent)
+            root = parent
+
+        children = {}
+        for child, parent in ppid_of.items():
+            children.setdefault(parent, []).append(child)
+
+        group = set()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node in group:
+                continue
+            group.add(node)
+            stack.extend(children.get(node, ()))
+        return frozenset(group)
+
+
+# --------------------------------------------------------------------------
+# Notifications
+# --------------------------------------------------------------------------
+
+_session = None  # (uid, gid, username, env) of the graphical session, cached
+
+# Session owners, best first. Any of them carries the environment we need; the
+# ordering just prefers the process least likely to be a transient child.
+_SESSION_OWNERS = ("xfce4-session", "xfsettingsd", "xfce4-panel", "xfdesktop",
+                   "xfwm4", "xfconfd", "dbus-daemon")
+_SESSION_ENV = ("DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY",
+                "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH")
+
+
+def find_session(force=False):
+    """Locate a logged-in graphical session to send notifications into.
+
+    We run as root outside any session, so notify-send needs to be handed the
+    user's DISPLAY and session bus and then dropped to their uid. Everything
+    needed for that is sitting in the environment of any process the session
+    started.
+    """
+    global _session
+    if _session and not force:
+        return _session
+
+    best = None
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            st = os.stat(f"/proc/{pid}")
+            if st.st_uid == 0:
+                continue
+            with open(f"/proc/{pid}/comm") as fh:
+                comm = fh.read().strip()
+            if comm not in _SESSION_OWNERS:
+                continue
+            with open(f"/proc/{pid}/environ", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+
+        env = {}
+        for item in raw.split(b"\0"):
+            key, sep, value = item.partition(b"=")
+            if sep:
+                key = key.decode("utf-8", "replace")
+                if key in _SESSION_ENV:
+                    env[key] = value.decode("utf-8", "replace")
+        if "DISPLAY" not in env or "DBUS_SESSION_BUS_ADDRESS" not in env:
+            continue
+
+        rank = _SESSION_OWNERS.index(comm)
+        if best is None or rank < best[0]:
+            try:
+                pw = pwd.getpwuid(st.st_uid)
+            except KeyError:
+                continue
+            env.setdefault("HOME", pw.pw_dir)
+            env.setdefault("USER", pw.pw_name)
+            env.setdefault("PATH", "/usr/local/bin:/usr/bin")
+            best = (rank, st.st_uid, st.st_gid, pw.pw_name, env)
+
+    _session = best[1:] if best else None
+    return _session
+
+
+def notify(summary, body, critical=False):
+    """Fire a desktop notification, without ever blocking the main loop.
+
+    fork+execve rather than subprocess: the child does no allocation between
+    fork and exec, which is what you want from code that runs exactly when the
+    machine has no memory to hand out.
+    """
+    log(f"notify: {summary} — {body}")
+    session = find_session()
+    if session is None:
+        session = find_session(force=True)
+        if session is None:
+            log("notify: no graphical session found; journal only")
+            return
+
+    uid, gid, username, env = session
+    argv = [
+        NOTIFY_SEND,
+        "--app-name=OOM Defender",
+        "--icon=" + ("dialog-error" if critical else "dialog-warning"),
+        "--urgency=" + ("critical" if critical else "normal"),
+        "--expire-time=" + ("0" if critical else "12000"),
+        # Collapse repeats onto one bubble instead of stacking a wall of them.
+        "--hint=string:x-canonical-private-synchronous:oom-defender",
+        summary,
+        body,
+    ]
+
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        log(f"notify: fork failed: {exc}")
+        return
+    if pid == 0:
+        try:
+            os.setgid(gid)
+            os.initgroups(username, gid)
+            os.setuid(uid)
+            os.execve(NOTIFY_SEND, argv, env)
+        except BaseException:
+            pass
+        os._exit(127)
+
+
+# --------------------------------------------------------------------------
+# The defender
+# --------------------------------------------------------------------------
+
+class Defender:
+    def __init__(self, cfg, dry_run=False):
+        self.cfg = cfg
+        self.protect = protected_names(cfg)
+        self.dry_run = dry_run or bool(cfg["dry_run"])
+        self.frozen = []          # Victims currently under SIGSTOP
+        self.freeze_psi_since = None
+        self.kill_psi_since = None
+        self.kill_cooldown_until = 0.0
+        self.last_freeze = 0.0
+        self.reload_requested = False
+        self.running = True
+        self.attention = Attention(cfg)
+        self.tracker = Tracker()
+        self.ranked = []
+        self.ranked_at = 0.0
+
+    def candidates(self, mem, now):
+        """The ordered victim list, refreshed at most every scan_interval.
+
+        Called on every tick rather than only when acting, because growth and
+        CPU are rates: asking for them the instant an emergency starts would
+        get zeroes back, and the whole point is to know which process has been
+        the one growing.
+        """
+        if self.ranked and now - self.ranked_at < self.cfg["scan_interval"]:
+            return self.ranked
+        sized, ppid_of, comm_of = scan_processes()
+        self.attention.refresh(now, ppid_of, comm_of, self.protect)
+        self.ranked = rank_victims(sized, mem, self.protect, self.cfg,
+                                   self.attention, self.tracker, now)
+        self.ranked_at = now
+        return self.ranked
+
+    # -- signalling ------------------------------------------------------
+
+    def _signal(self, victim, sig, what):
+        if not victim.alive():
+            return False
+        if self.dry_run:
+            log(f"[dry-run] would {what} {victim}")
+            return True
+        try:
+            os.kill(victim.pid, sig)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            log(f"cannot {what} {victim}: {exc}")
+            return False
+        return True
+
+    def freeze(self, victim, mem, psi):
+        if not self._signal(victim, signal.SIGSTOP, "freeze"):
+            return
+        victim.frozen_at = self.last_freeze = time.monotonic()
+        self.frozen.append(victim)
+        log(f"FREEZE {victim} tier {victim.tier} cpu {victim.cpu:.0f}% "
+            f"growth {victim.growth / 1024:+.1f} MB/s at mem {mem.mem_pct:.1f}% "
+            f"swap {mem.swap_pct:.1f}% psi {psi:.0f}")
+        others = len(self.frozen) - 1
+        notify(
+            f"Frozen: {victim.name}",
+            f"Memory was down to {mem.mem_pct:.0f}% free, so OOM Defender "
+            f"suspended {victim.name} (PID {victim.pid}, {victim.kb / 1024:.0f} MB) "
+            f"to stop it allocating — {victim.why()}. It resumes automatically "
+            f"once memory recovers, or is killed in "
+            f"{self.cfg['freeze_grace']:.0f}s if it doesn't."
+            + (f" {others} other process(es) already suspended." if others else ""),
+        )
+
+    def release(self, reason):
+        for victim in self.frozen:
+            if self._signal(victim, signal.SIGCONT, "resume"):
+                log(f"RESUME {victim} ({reason})")
+        if self.frozen and not self.dry_run:
+            names = ", ".join(v.name for v in self.frozen)
+            notify(f"Resumed: {names}", f"Memory recovered — {reason}.")
+        self.frozen = []
+
+    def kill(self, victim, mem, psi, reason):
+        before = mem.avail
+        # A SIGSTOPped process still dies on SIGKILL; no SIGCONT needed first.
+        if not self._signal(victim, signal.SIGKILL, "kill"):
+            return
+        log(f"KILL {victim} at mem {mem.mem_pct:.1f}% swap {mem.swap_pct:.1f}% "
+            f"psi {psi:.0f} ({reason})")
+
+        # Wait briefly for the memory to actually come back, so the
+        # notification can say how much the kill bought.
+        freed = 0
+        if not self.dry_run:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not victim.alive():
+                    freed = max(0, read_meminfo().avail - before)
+                    break
+                time.sleep(0.05)
+
+        self.frozen = [v for v in self.frozen if v.pid != victim.pid]
+        notify(
+            f"Killed: {victim.name}",
+            f"OOM Defender killed {victim.name} (PID {victim.pid}, "
+            f"{victim.kb / 1024:.0f} MB) to keep the system responsive — "
+            f"{reason}, and {victim.why()}. "
+            + (f"{freed / 1024:.0f} MB came back." if freed else ""),
+            critical=True,
+        )
+        self.kill_cooldown_until = time.monotonic() + self.cfg["kill_cooldown"]
+        # PSI is a trailing average and will still read high for several
+        # seconds after the cause is gone. Forget what we saw.
+        self.freeze_psi_since = self.kill_psi_since = None
+        self.release("the hog is gone")
+
+    # -- the loop --------------------------------------------------------
+
+    def sustained(self, since, psi, threshold, seconds, now):
+        """Track how long PSI has sat above a threshold. Returns (since, fired)."""
+        if psi < threshold:
+            return None, False
+        if since is None:
+            since = now
+        return since, (now - since) >= seconds
+
+    def tick(self):
+        cfg = self.cfg
+        now = time.monotonic()
+        mem = read_meminfo()
+        psi = read_psi_full_avg10()
+
+        self.freeze_psi_since, thrash_freeze = self.sustained(
+            self.freeze_psi_since, psi, cfg["freeze_psi"], cfg["freeze_psi_secs"], now)
+        self.kill_psi_since, thrash_kill = self.sustained(
+            self.kill_psi_since, psi, cfg["kill_psi"], cfg["kill_psi_secs"], now)
+
+        starved_kill = (mem.mem_pct <= cfg["kill_mem_pct"]
+                        and mem.swap_pct <= cfg["kill_swap_pct"])
+        starved_freeze = (mem.mem_pct <= cfg["freeze_mem_pct"]
+                          and mem.swap_pct <= cfg["freeze_swap_pct"])
+
+        # Drop anything that died while frozen — its memory is already back.
+        self.frozen = [v for v in self.frozen if v.alive()]
+
+        # Freezing buys time, it does not free a byte. If the grace period
+        # passed and we are still in trouble, the freeze failed and something
+        # has to go.
+        stale = (self.frozen and (starved_freeze or thrash_freeze)
+                 and now - self.frozen[0].frozen_at >= cfg["freeze_grace"])
+
+        # Kept warm on every tick: growth and CPU are rates, and a list first
+        # built at the moment of the emergency knows neither.
+        victims = self.candidates(mem, now)
+
+        if (starved_kill or thrash_kill or stale) and now >= self.kill_cooldown_until:
+            reason = ("free memory exhausted" if starved_kill
+                      else "the system was thrashing" if thrash_kill
+                      else "freezing it did not free enough")
+            # Re-pick rather than inherit the frozen victim: over 20 seconds
+            # the process holding the machine down may well have changed.
+            ranked = kill_order(victims, self.cfg)
+            if ranked:
+                self.kill(ranked[0], mem, psi, reason)
+            else:
+                log("nothing eligible to kill — everything big enough is protected")
+            return mem
+
+        if (starved_freeze or thrash_freeze) \
+                and len(self.frozen) < self.cfg["max_frozen"] \
+                and now - self.last_freeze >= self.cfg["freeze_interval"]:
+            # One more idle process per interval rather than one per episode.
+            # Suspending four things nobody is looking at is a far gentler way
+            # out of this than killing the one biggest thing, and each freeze
+            # gets an interval to show whether it was enough.
+            already = {v.pid for v in self.frozen}
+            for victim in victims:
+                if victim.pid not in already:
+                    self.freeze(victim, mem, psi)
+                    break
+            else:
+                log("nothing left to freeze — everything big enough is "
+                    "protected or already suspended")
+            return mem
+
+        if self.frozen and mem.mem_pct >= cfg["release_mem_pct"] \
+                and psi <= cfg["freeze_psi"] / 2:
+            self.release(f"{mem.mem_pct:.0f}% free")
+        elif self.frozen and not (starved_freeze or thrash_freeze) \
+                and now - self.frozen[0].frozen_at >= cfg["freeze_max_secs"]:
+            # Nothing is firing any more, but memory never climbed back to
+            # release_mem_pct either — the gap this machine spends most of its
+            # life in. Waiting for a full recovery that may not come is how a
+            # freeze turns into an eleven-minute hang.
+            self.release(f"held {cfg['freeze_max_secs']:.0f}s with nothing "
+                         f"still firing")
+
+        return mem
+
+    def run(self):
+        log(f"OOM Defender watching: freeze below {self.cfg['freeze_mem_pct']:.0f}% "
+            f"free memory, kill below {self.cfg['kill_mem_pct']:.0f}%"
+            + (" [DRY RUN]" if self.dry_run else ""))
+        while self.running:
+            if self.reload_requested:
+                self.reload_requested = False
+                self.cfg = load_config()
+                self.protect = protected_names(self.cfg)
+                log("config reloaded")
+            try:
+                mem = self.tick()
+            except Exception as exc:  # never let one bad read end the watch
+                log(f"tick failed: {exc!r}")
+                time.sleep(1.0)
+                continue
+            # Poll harder the closer we get; one small read costs nothing, and
+            # a runaway allocator can cross the last 10% in well under a second.
+            pct = mem.mem_pct
+            time.sleep(1.0 if pct > 30 else 0.5 if pct > 20
+                       else 0.2 if pct > 12 else 0.1)
+
+    def shutdown(self, signum, _frame):
+        # A process left under SIGSTOP is indistinguishable from a hung one.
+        # Whatever happens to us, it gets to run again.
+        self.running = False
+        log(f"signal {signum} — releasing {len(self.frozen)} frozen process(es)")
+        for victim in self.frozen:
+            self._signal(victim, signal.SIGCONT, "resume")
+        self.frozen = []
+        sys.exit(0)
+
+
+# --------------------------------------------------------------------------
+# Entry points
+# --------------------------------------------------------------------------
+
+def lock_memory():
+    """mlockall(MCL_CURRENT | MCL_FUTURE).
+
+    A watchdog that is itself paged out arrives late to exactly the emergency
+    it exists for. Needs LimitMEMLOCK=infinity in the unit; systemd's 8 MB
+    default is not enough for a Python process.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.mlockall(1 | 2) != 0:
+            err = ctypes.get_errno()
+            log(f"mlockall failed ({os.strerror(err)}) — running unlocked")
+    except OSError as exc:
+        log(f"mlockall unavailable: {exc}")
+
+
+def print_status(cfg):
+    mem = read_meminfo()
+    psi = read_psi_full_avg10()
+    print(f"memory   {mem.avail / 1024:7.0f} MB free of {mem.total / 1024:.0f} MB"
+          f"   ({mem.mem_pct:.1f}%)")
+    print(f"swap     {mem.swap_free / 1024:7.0f} MB free of "
+          f"{mem.swap_total / 1024:.0f} MB   ({mem.swap_pct:.1f}%)")
+    print(f"pressure {psi:7.1f}   (memory PSI full avg10)")
+    print()
+    print(f"freeze at mem <= {cfg['freeze_mem_pct']:.0f}% and swap <= "
+          f"{cfg['freeze_swap_pct']:.0f}%, or PSI >= {cfg['freeze_psi']:.0f} for "
+          f"{cfg['freeze_psi_secs']:.0f}s")
+    print(f"kill   at mem <= {cfg['kill_mem_pct']:.0f}% and swap <= "
+          f"{cfg['kill_swap_pct']:.0f}%, or PSI >= {cfg['kill_psi']:.0f} for "
+          f"{cfg['kill_psi_secs']:.0f}s")
+    print()
+
+    # Two sweeps with a gap between them: growth and CPU are rates, and one
+    # sample cannot show a rate. Without this the whole table would read 0.
+    protect = protected_names(cfg)
+    attention = Attention(cfg)
+    tracker = Tracker()
+    sized, ppid_of, comm_of = scan_processes()
+    attention.refresh(time.monotonic(), ppid_of, comm_of, protect)
+    rank_victims(sized, mem, protect, cfg, attention, tracker, time.monotonic())
+    time.sleep(0.6)
+    now = time.monotonic()
+    sized, ppid_of, comm_of = scan_processes()
+    attention.refresh(now, ppid_of, comm_of, protect)
+    victims = rank_victims(sized, mem, protect, cfg, attention, tracker, now)
+
+    if not cfg["focus_aware"]:
+        print("focus    ignored (focus_aware = 0) — ranking by size alone")
+    elif attention.pid:
+        print(f"focus    {comm_of.get(attention.pid, '?')} [{attention.pid}] "
+              f"and {max(0, len(attention.group) - 1)} process(es) behind it")
+    else:
+        print("focus    unknown (no X session, or the focused window sets no "
+              "PID) — ranking by size alone")
+    print()
+
+    print(f"next in line (under {cfg['min_victim_mb']:.0f} MB is never touched; "
+          f"score is projected share of RAM per mille + oom_score_adj):")
+    for victim in victims[:10]:
+        mark = "  " if victim.tier == 0 else "~ " if victim.tier == 1 else "* "
+        print(f"  {mark}{victim.points:6.0f}  {victim.kb / 1024:7.0f} MB  "
+              f"{victim.cpu:4.0f}% cpu  {victim.growth / 1024:+6.1f} MB/s  "
+              f"{'in use' if victim.busy else '  idle'}  "
+              f"{victim.name} [{victim.pid}]")
+    if not victims:
+        print("  (nothing eligible — everything big enough is protected)")
+    else:
+        print()
+        print("  ~ belongs to the focused app   * is the focused window itself")
+        print("  Both are reached only once everything above them is exhausted.")
+
+
+def main():
+    args = sys.argv[1:]
+    cfg = load_config()
+
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+
+    if "--status" in args:
+        print_status(cfg)
+        return 0
+
+    if "--test-notify" in args:
+        if os.geteuid() != 0:
+            print("--test-notify has to run as root, the way the service does",
+                  file=sys.stderr)
+            return 1
+        notify("OOM Defender is watching",
+               "This is a test. If you can read it, the defender can reach you "
+               "when it matters.")
+        time.sleep(1)  # let the forked notify-send finish before we exit
+        return 0
+
+    dry_run = "--dry-run" in args
+    for arg in args:
+        if arg not in ("--dry-run",):
+            print(f"unknown argument: {arg}", file=sys.stderr)
+            return 1
+
+    # Dry runs signal nothing, so they are worth being able to watch as
+    # yourself; a real run has to reach other users' processes.
+    if os.geteuid() != 0 and not dry_run:
+        print("oom-defender must run as root — it signals other users' processes",
+              file=sys.stderr)
+        return 1
+
+    # Belt and braces: the unit sets this too, but running it by hand should
+    # not put the watchdog first in line to be killed.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("-1000")
+    except OSError as exc:
+        log(f"could not set own oom_score_adj: {exc}")
+
+    lock_memory()
+
+    defender = Defender(cfg, dry_run=dry_run)
+    signal.signal(signal.SIGTERM, defender.shutdown)
+    signal.signal(signal.SIGINT, defender.shutdown)
+    signal.signal(signal.SIGHUP,
+                  lambda *_: setattr(defender, "reload_requested", True))
+    # We never wait on the notify-send children; let the kernel reap them.
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
+    defender.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# battery-power-profile <performance|default|saver|extreme>  — the privileged
+# half of the power profile: everything that has to be written as root.
+#
+# Installed to /usr/local/libexec/battery-power-profile by
+# install-power-profile.sh, which is also what the sudoers rule names. It has
+# to live outside the home directory: a NOPASSWD rule pointing at a script the
+# user can edit is a root shell with extra steps.
+#
+# Nothing here is a hard requirement — a knob the kernel doesn't expose (no
+# intel_pstate, no discrete-freq GPU) is skipped rather than failing the whole
+# profile, so the same script works on a machine with a different chipset.
+#
+# "default" is not a set of values, it's whatever the machine was doing before
+# any profile was applied: the knobs are snapshotted to $BASELINE on the way
+# out of default and written back on the way in. Stock values are only used if
+# that snapshot is missing. Every other profile is an explicit set of values.
+set -uo pipefail
+shopt -s nullglob
+
+BASELINE_DIR=/var/lib/battery-power-profile
+BASELINE="$BASELINE_DIR/baseline"
+
+CPUFREQ=(/sys/devices/system/cpu/cpu[0-9]*/cpufreq)
+PSTATE=/sys/devices/system/cpu/intel_pstate
+GPU=(/sys/class/drm/card[0-9]*)
+
+# The "no restriction" values, for the profiles that lift one. These are not
+# used to fake a baseline — see restore().
+STOCK_MAX_PERF=100
+STOCK_LAPTOP_MODE=0
+STOCK_WRITEBACK=500
+STOCK_NMI=1
+
+# The CPU ceiling as a percentage of the top turbo bin. 50% lands around the
+# base clock on this part — slow, but not so slow that the desktop stutters.
+EXTREME_MAX_PERF=50
+
+usage() {
+    echo "usage: ${0##*/} <performance|default|saver|extreme>" >&2
+    exit 2
+}
+
+# --- sysfs helpers ---------------------------------------------------------
+# Writes are best-effort: a knob can exist and still refuse the value (the
+# kernel rejects an ASPM policy it wasn't built for, for one), and that must
+# not abort the rest of the profile.
+
+poke() {  # poke <value> <path>...
+    local value=$1 path
+    shift
+    # An empty value is a knob the baseline never captured, not a value to
+    # write — no profile writes an empty string on purpose.
+    [[ -n $value ]] || return 0
+    for path in "$@"; do
+        [[ -w $path ]] || continue
+        printf '%s\n' "$value" >"$path" 2>/dev/null || true
+    done
+}
+
+peek() {  # peek <path>... — the first readable one, or empty
+    local path
+    for path in "$@"; do
+        [[ -r $path ]] || continue
+        cat "$path" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# module parameters and sysctls that list their options inline, e.g.
+# "[default] performance powersave" — the active one is the bracketed token.
+peek_bracketed() {
+    local raw
+    raw=$(peek "$@") || return 1
+    [[ $raw =~ \[([^]]+)\] ]] && { echo "${BASH_REMATCH[1]}"; return 0; }
+    echo "$raw"
+}
+
+cpu_paths() {  # cpu_paths <attr> — the same attribute across every core
+    local attr=$1 dir
+    for dir in "${CPUFREQ[@]}"; do echo "$dir/$attr"; done
+}
+
+set_cpu() {  # set_cpu <governor> <epp>
+    # Order matters: writing scaling_governor resets the energy performance
+    # preference to that governor's default, so EPP has to come second.
+    [[ -n $1 ]] && poke "$1" $(cpu_paths scaling_governor)
+    [[ -n $2 ]] && poke "$2" $(cpu_paths energy_performance_preference)
+}
+
+set_gpu_max() {  # set_gpu_max <mhz|"">  — empty means "back to hardware max"
+    local card mhz
+    for card in "${GPU[@]}"; do
+        [[ -e $card/gt_max_freq_mhz ]] || continue
+        mhz=$1
+        [[ -n $mhz ]] || mhz=$(peek "$card/gt_RP0_freq_mhz") || continue
+        # Boost tracks max, or it just overrides the ceiling we set.
+        poke "$mhz" "$card/gt_max_freq_mhz" "$card/gt_boost_freq_mhz"
+    done
+}
+
+# --- baseline --------------------------------------------------------------
+
+snapshot() {
+    # Only the first departure from default records anything; saver -> extreme
+    # must not overwrite the snapshot with saver's own values.
+    [[ -e $BASELINE ]] && return 0
+    mkdir -p "$BASELINE_DIR" || return 0
+    {
+        echo "governor=$(peek $(cpu_paths scaling_governor))"
+        echo "epp=$(peek $(cpu_paths energy_performance_preference))"
+        echo "no_turbo=$(peek $PSTATE/no_turbo)"
+        echo "max_perf=$(peek $PSTATE/max_perf_pct)"
+        echo "gpu_max=$(peek "${GPU[@]/%//gt_max_freq_mhz}")"
+        echo "snd=$(peek /sys/module/snd_hda_intel/parameters/power_save)"
+        echo "aspm=$(peek_bracketed /sys/module/pcie_aspm/parameters/policy)"
+        echo "laptop_mode=$(peek /proc/sys/vm/laptop_mode)"
+        echo "writeback=$(peek /proc/sys/vm/dirty_writeback_centisecs)"
+        echo "nmi=$(peek /proc/sys/kernel/nmi_watchdog)"
+    } >"$BASELINE.tmp" 2>/dev/null && mv "$BASELINE.tmp" "$BASELINE"
+}
+
+restore() {
+    # No snapshot means nothing was ever taken away, so there is nothing to put
+    # back — and writing a guessed set of "stock" values here would be actively
+    # wrong: the guess (EPP balance_performance) is not what this machine
+    # actually boots at (EPP performance), so a restore-from-nothing would
+    # quietly downgrade a machine that had never left default.
+    #
+    # The invariant that makes this safe: the baseline is written on every
+    # departure from default and removed only on the way back, so "no baseline"
+    # means "already at default".
+    [[ -r $BASELINE ]] || return 0
+
+    local governor="" epp="" no_turbo="" max_perf="" gpu_max=""
+    local snd="" aspm="" laptop_mode="" writeback="" nmi=""
+    local key value
+
+    while IFS='=' read -r key value; do
+        # A knob that was absent when we snapshotted stays absent; inventing a
+        # value for it would write something we never actually saw.
+        [[ -n $value ]] || continue
+        case $key in
+            governor) governor=$value ;;
+            epp) epp=$value ;;
+            no_turbo) no_turbo=$value ;;
+            max_perf) max_perf=$value ;;
+            gpu_max) gpu_max=$value ;;
+            snd) snd=$value ;;
+            aspm) aspm=$value ;;
+            laptop_mode) laptop_mode=$value ;;
+            writeback) writeback=$value ;;
+            nmi) nmi=$value ;;
+        esac
+    done <"$BASELINE"
+
+    set_cpu "$governor" "$epp"
+    poke "$no_turbo" $PSTATE/no_turbo
+    poke "$max_perf" $PSTATE/max_perf_pct
+    set_gpu_max "$gpu_max"
+    poke "$snd" /sys/module/snd_hda_intel/parameters/power_save
+    poke "$aspm" /sys/module/pcie_aspm/parameters/policy
+    poke "$laptop_mode" /proc/sys/vm/laptop_mode
+    poke "$writeback" /proc/sys/vm/dirty_writeback_centisecs
+    poke "$nmi" /proc/sys/kernel/nmi_watchdog
+
+    rm -f "$BASELINE"
+}
+
+# --- profiles --------------------------------------------------------------
+
+apply_performance() {
+    # Every ceiling off and both bias knobs pinned to performance. Unlike the
+    # firmware's own idea of performance this ignores whether you're on mains:
+    # nothing here reads the AC state, so it holds on battery too.
+    #
+    # The clock *floor* (min_perf_pct) is deliberately left where it is. Pinning
+    # it to 100 keeps all four cores at max even while idle, which on a part
+    # this small just heats it into thermal throttling and gives back the
+    # performance it was supposed to buy — the governor already jumps to max
+    # the moment there's work. Raise it here if you want it anyway.
+    set_cpu performance performance
+    poke 0 $PSTATE/no_turbo
+    poke "$STOCK_MAX_PERF" $PSTATE/max_perf_pct
+    set_gpu_max ""
+    # Audio codec autosuspend off: costs idle power, buys no pop on the first
+    # sound after silence.
+    poke 0 /sys/module/snd_hda_intel/parameters/power_save
+    poke performance /sys/module/pcie_aspm/parameters/policy
+    poke "$STOCK_LAPTOP_MODE" /proc/sys/vm/laptop_mode
+    poke "$STOCK_WRITEBACK" /proc/sys/vm/dirty_writeback_centisecs
+    poke "$STOCK_NMI" /proc/sys/kernel/nmi_watchdog
+}
+
+apply_saver() {
+    # Turbo off is the single biggest win here: the top bins cost
+    # disproportionately more power than the frequency they buy. The frequency
+    # ceiling itself is left alone, so bursty work still finishes at full base
+    # speed rather than dragging out.
+    set_cpu powersave balance_power
+    poke 1 $PSTATE/no_turbo
+    poke "$STOCK_MAX_PERF" $PSTATE/max_perf_pct
+    set_gpu_max ""
+    poke 1 /sys/module/snd_hda_intel/parameters/power_save
+    poke powersave /sys/module/pcie_aspm/parameters/policy
+    # Batch writeback so the disk gets longer idle runs.
+    poke 5 /proc/sys/vm/laptop_mode
+    poke 1500 /proc/sys/vm/dirty_writeback_centisecs
+    poke "$STOCK_NMI" /proc/sys/kernel/nmi_watchdog
+}
+
+apply_extreme() {
+    # Everything saver does, plus hard ceilings on both CPU and GPU. This one
+    # is meant to be felt: it trades responsiveness for runtime.
+    set_cpu powersave power
+    poke 1 $PSTATE/no_turbo
+    poke "$EXTREME_MAX_PERF" $PSTATE/max_perf_pct
+
+    # RP1 is the GPU's own efficient operating point — the fastest clock it can
+    # hold without leaving its efficiency curve.
+    local card rp1=""
+    for card in "${GPU[@]}"; do
+        rp1=$(peek "$card/gt_RP1_freq_mhz") && break
+    done
+    set_gpu_max "$rp1"
+
+    poke 1 /sys/module/snd_hda_intel/parameters/power_save
+    poke powersupersave /sys/module/pcie_aspm/parameters/policy
+    poke 5 /proc/sys/vm/laptop_mode
+    poke 6000 /proc/sys/vm/dirty_writeback_centisecs
+    # Costs a timer interrupt per core per second; the tradeoff is losing
+    # hard-lockup detection, which is why it's only given up at this level.
+    poke 0 /proc/sys/kernel/nmi_watchdog
+}
+
+# --- main ------------------------------------------------------------------
+
+[[ $# -eq 1 ]] || usage
+[[ $EUID -eq 0 ]] || { echo "${0##*/}: must run as root" >&2; exit 1; }
+
+case $1 in
+    default)     restore ;;
+    performance) snapshot; apply_performance ;;
+    saver)       snapshot; apply_saver ;;
+    extreme)     snapshot; apply_extreme ;;
+    *)           usage ;;
+esac

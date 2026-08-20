@@ -1,0 +1,14 @@
+#!/bin/bash
+# nightlight-gui — slider popup for live night light intensity adjustment.
+CONF="$HOME/.config/redshift/redshift.conf"
+NIGHTLIGHT="$(cd "$(dirname "$0")" && pwd)/nightlight"
+
+current_temp=$(grep -oP '(?<=^temp-day=)\d+' "$CONF")
+current_pct=$(( (6500 - current_temp) / 40 ))
+
+yad --title="Night Light" --text="Night light intensity" \
+    --scale --min-value=0 --max-value=100 --value="$current_pct" --step=5 \
+    --print-partial --width=320 --center --on-top --button=Close:0 |
+while read -r pct; do
+    "$NIGHTLIGHT" "$pct" >/dev/null
+done

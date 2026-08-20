@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# power-profile [performance|default|saver|extreme]
+#                                — get or set the power profile.
+# power-profile --reapply        — re-assert the saved profile.
+# power-profile --auto [on|off]  — get or set whether AC drives the profile.
+# power-profile --sync           — apply what the current AC state calls for.
+#
+#   performance  every ceiling off, CPU and GPU biased hard toward speed.
+#                Holds on battery too — nothing drops it when you unplug
+#                except the AC follow below, and only if it was the one that
+#                turned it on.
+#   default      the machine as it was before any profile was applied. Not a
+#                middle setting: it's a snapshot, and on this laptop it already
+#                means turbo on, no caps and EPP performance.
+#   saver        turbo off, deeper idle states, batched disk writeback.
+#   extreme      saver plus hard CPU and GPU frequency ceilings.
+#
+# With AC follow on — the default — plugging in switches to performance and
+# unplugging puts back the profile that was on before. The displaced profile is
+# remembered in $RESTORE_FILE, and that file's existence is exactly the claim
+# "AC is the reason this machine is in performance": written when AC engages,
+# consumed on unplug. Picking a profile by hand while plugged in overwrites it
+# with your pick, so what comes back on unplug is the last thing you asked for
+# rather than something you left behind an hour ago.
+#
+# Screen brightness is deliberately left alone, even though it's the biggest
+# draw on the machine — the backlight belongs to the brightness tray and to
+# whoever is looking at the screen, not to this script.
+#
+# This half runs as you and owns the state; the sysfs writes need root and are
+# handed to the installed helper, so install-power-profile.sh has to have been
+# run once. --reapply exists because sysfs doesn't survive a reboot while the
+# state file does: the tray calls it at login to put the profile back, then
+# --sync to settle it against the AC line.
+set -uo pipefail
+
+HELPER=/usr/local/libexec/battery-power-profile
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/battery"
+PROFILE_FILE="$STATE/profile"
+AUTO_FILE="$STATE/auto"
+RESTORE_FILE="$STATE/ac-restore"
+POWER_SUPPLY=/sys/class/power_supply
+
+usage() {
+    echo "usage: ${0##*/} [performance|default|saver|extreme]" >&2
+    echo "       ${0##*/} --reapply | --sync | --auto [on|off]" >&2
+    exit 2
+}
+
+# Anything unset or unrecognised means default, so a missing or corrupt state
+# file reports the machine as untouched rather than claiming a profile that was
+# never applied.
+valid() {  # valid <name> — the profile, or default
+    case "$1" in
+        performance|saver|extreme) echo "$1" ;;
+        *)                         echo default ;;
+    esac
+}
+
+current() {
+    valid "$(cat "$PROFILE_FILE" 2>/dev/null)"
+}
+
+# Unset means on: following the AC line is what this is set up to do, and a
+# state file that hasn't been written yet shouldn't read as "turned off".
+auto() {
+    if [[ $(cat "$AUTO_FILE" 2>/dev/null) == off ]]; then echo off; else echo on; fi
+}
+
+# True while a mains supply is online. The touchpad and the USB-C port also
+# publish an "online" here, so the type has to be checked — only Mains is the
+# wall socket.
+on_ac() {
+    local device
+    for device in "$POWER_SUPPLY"/*; do
+        [[ $(cat "$device/type" 2>/dev/null) == Mains ]] || continue
+        [[ $(cat "$device/online" 2>/dev/null) == 1 ]] && return 0
+    done
+    return 1
+}
+
+apply() {  # apply <profile>
+    if [[ ! -x $HELPER ]]; then
+        echo "${0##*/}: $HELPER is missing — run:" >&2
+        echo "  sudo bash $(dirname "$(readlink -f "$0")")/install-power-profile.sh" >&2
+        return 1
+    fi
+    # pkexec is the fallback for a helper installed without the sudoers rule:
+    # it works, it just asks for a password every time.
+    sudo -n "$HELPER" "$1" 2>/dev/null && return 0
+    pkexec "$HELPER" "$1"
+}
+
+set_profile() {  # set_profile <profile>
+    apply "$1" || return 1
+    mkdir -p "$STATE"
+    printf '%s\n' "$1" >"$PROFILE_FILE"
+}
+
+# The hand-picked path. A choice made while AC is holding the machine in
+# performance becomes the thing handed back on unplug — so the pick stands,
+# both now and later.
+#
+# The restore point is rewritten rather than deleted, even though deleting it
+# would leave the same profile on screen: while plugged in, its absence means
+# "not engaged", and the next --sync would take that as licence to force
+# performance straight back over the top of the choice just made.
+choose() {  # choose <profile>
+    set_profile "$1" || return 1
+    if [[ -e $RESTORE_FILE ]]; then
+        printf '%s\n' "$1" >"$RESTORE_FILE"
+    fi
+}
+
+set_auto() {  # set_auto <on|off>
+    mkdir -p "$STATE"
+    printf '%s\n' "$1" >"$AUTO_FILE"
+    if [[ $1 == on ]]; then
+        # Take effect now rather than at the next plug event, which on a
+        # machine that's already plugged in could be days away.
+        sync_ac
+    else
+        # Turning it off means the machine is yours again: whatever is on stays
+        # on, and there's no pending hand-back to trip over later.
+        rm -f "$RESTORE_FILE"
+    fi
+}
+
+# Reconcile with the AC line. Idempotent, so the tray can call it on every
+# transition and once at login without tracking what it already did.
+sync_ac() {
+    local before target
+    if on_ac; then
+        [[ $(auto) == on ]] || return 0
+        # Already engaged: re-saving the restore point here would overwrite the
+        # profile we're meant to hand back with performance itself.
+        [[ -e $RESTORE_FILE ]] && return 0
+        before=$(current)
+        set_profile performance || return 1
+        mkdir -p "$STATE"
+        printf '%s\n' "$before" >"$RESTORE_FILE"
+    else
+        # Deliberately not gated on $(auto): if AC put this machine in
+        # performance, unplugging hands it back even if the follow was switched
+        # off in between, rather than stranding it there with a stale note.
+        [[ -e $RESTORE_FILE ]] || return 0
+        target=$(valid "$(cat "$RESTORE_FILE" 2>/dev/null)")
+        rm -f "$RESTORE_FILE"
+        [[ $(current) == "$target" ]] || set_profile "$target"
+    fi
+}
+
+case ${1-} in
+    "")  current ;;
+    performance|default|saver|extreme)  choose "$1" ;;
+    # Re-applying default would be a sudo call to write the values already
+    # there, at every login, so only a real profile is worth re-asserting.
+    --reapply)  [[ $(current) == default ]] || set_profile "$(current)" ;;
+    --sync)     sync_ac ;;
+    --auto)
+        case ${2-} in
+            "")      auto ;;
+            on|off)  set_auto "$2" ;;
+            *)       usage ;;
+        esac
+        ;;
+    *)   usage ;;
+esac
