@@ -84,11 +84,12 @@ Requires `redshift` and `yad`.
 
 ## `monitor/`
 
-The login screen on the monitor you're actually looking at, at the size the
-session uses.
+Which size the screen runs at, and a login screen that agrees with it.
 
 | Script | What it does |
 |---|---|
+| `resolution` | The CLI and the single owner of resolution changes. `resolution` prints the current mode, `resolution highest\|fullhd\|lowest` sets one, `resolution --list` prints all three plus the active one in a parseable form. |
+| `resolution-tray.py` | The tray icon those are picked from. |
 | `monitor-greeter` | Applies the session's saved XFCE display layout to the greeter's X server, before the greeter draws. Root-owned copy in `/usr/local/libexec`, run by LightDM. |
 | `install-monitor-greeter.sh` | One-shot `sudo` install of that copy, the LightDM drop-in that calls it, and the greeter-side fallback. |
 
@@ -237,6 +238,62 @@ That prints the `xrandr` command instead of running it, and is the way to check
 what the login screen will do while you're still looking at a working desktop.
 
 Requires `xorg-xrandr`.
+
+### The resolution tray
+
+`resolution-tray.py` puts a display icon in the top panel's systray. Clicking it
+offers three presets for whichever output is currently primary:
+
+| Preset | On the LG | How it's chosen |
+|---|---|---|
+| Highest | 3840x2160 @ 60 Hz | most pixels, then fastest rate |
+| Full HD | 1920x1080 @ 60 Hz | nearest mode to 1920x1080 |
+| Lowest | 640x480 @ 60 Hz | fewest pixels, then fastest rate |
+
+Nothing is hard-coded to this monitor. The presets are resolved from `xrandr`'s
+mode list for the primary output on each read, so they still mean something on a
+different screen, and Full HD degrades to the closest available mode rather than
+failing on a monitor with no exact 1920x1080. The LG's own ceiling is 3840x2160
+@ 60: its EDID caps the pixel clock at 600 MHz, hsync at 135 kHz and vsync at
+61 Hz, and that mode sits on all three limits at once, so there is no higher
+resolution *and* no faster refresh at any lower one.
+
+**Three things move together on every switch**, which is why this is a script
+and not three `xrandr` aliases:
+
+1. **The XFCE profile, written first.** xfsettingsd re-applies its saved layout
+   on RandR events, so an `xrandr` call it doesn't know about is a change with a
+   timer on it. Writing `displays.xml` before calling xrandr means the daemon's
+   copy already agrees before it can react, and the mode survives a logout
+   instead of lasting until the next hotplug. `monitor-greeter` reads that same
+   file, so the login screen follows on the next boot.
+2. **The `--scale` transform, always reset to 1.** This display spent a while
+   running a 2328x1310 desktop bilinear-upscaled to 4K; switching modes without
+   clearing the transform composes the two and lands somewhere neither asked
+   for.
+3. **A UI tier.** Panel heights, icon sizes and the cursor are pixel counts and
+   don't follow resolution — left alone, 640x480 leaves a panel eating a sixth
+   of the screen and 4K leaves everything half-size. Font DPI moves with them
+   and is the one doing the visible work: it holds text at roughly the same
+   *physical* size on the glass across all three presets rather than the same
+   pixel size.
+
+| Band | DPI | Bar | Bar icons | Dock | Cursor |
+|---|---|---|---|---|---|
+| height >= 1800 | 144 | 43 | 26 | 79 | 26 |
+| height >= 1080 | 96 | 26 | 16 | 48 | 16 |
+| below | 72 | 20 | 12 | 36 | 12 |
+
+`TIERS_ENABLED=0 resolution fullhd` changes resolution and nothing else.
+
+**4K is not free on this machine.** Moving from the old upscaled desktop to a
+native 3840x2160 framebuffer took `shared` memory from ~247 MB to ~617 MB and
+`available` from ~1.17 GB to ~660 MB — worth reading next to the pre-launch
+memory rule in `oom/` below, because it comes straight off that cushion. Full HD
+hands most of it back, which is a real use for the middle preset beyond taste.
+
+Requires PyGObject (`python-gobject`); `xrandr` and `xfconf-query` are already
+part of the desktop.
 
 ---
 
@@ -878,6 +935,7 @@ Everything that points into this folder. Update these if the folder moves:
 | `~/.config/autostart/battery-tray.desktop` | `battery/battery-tray.py` |
 | `~/.config/autostart/touchpad-tweaks.desktop` | `touchpad/apply-touchpad.sh` |
 | `~/.config/autostart/nolock-tray.desktop` | `nolock/nolock-tray.py` |
+| `~/.config/autostart/resolution-tray.desktop` | `monitor/resolution-tray.py` |
 | `~/.local/share/applications/nightlight-gui.desktop` | `nightlight/nightlight-gui` |
 | xfconf `xfce4-keyboard-shortcuts` → `/commands/custom/<Super>n` | `nightlight/nightlight-gui` |
 | xfconf `xfce4-keyboard-shortcuts` → `/commands/custom/<Super>u` | `nolock/nolock` |
