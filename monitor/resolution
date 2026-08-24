@@ -37,17 +37,67 @@
 # Panel heights, icon sizes and the cursor are pixel counts — they don't follow
 # resolution, so left alone a preset that quarters the screen leaves a panel
 # eating a sixth of it, and 4K leaves everything half-size. Each preset carries
-# a matching tier for those (see TIERS below). Font DPI moves with them, which
-# is the one that does the visible work: it holds text at roughly the same
-# physical size on the glass across all three presets rather than the same
-# pixel size. Set TIERS_ENABLED=0 to switch resolution and nothing else.
+# a matching tier for those. Font DPI moves with them, which is the one that
+# does the visible work: it holds text at roughly the same physical size on the
+# glass rather than the same pixel size. Set TIERS_ENABLED=0 to switch
+# resolution and nothing else.
 #
-# Usage: resolution [status|highest|fullhd|lowest|--list] [--quiet]
+# The tier is computed from the millimetres in the monitor's EDID, which xrandr
+# reports on the output's `connected` line, and not from the pixel count. Pixel
+# count is the wrong input the moment there is more than one monitor: it says a
+# mode with fewer pixels is a physically larger screen, which holds while one
+# panel changes modes and is false across two. This machine is the counter-
+# example — the 27" 4K is 3840 px over 600 mm (163 dpi) and the laptop is 1366
+# px over 256 mm (136 dpi), so by pixel count the laptop looks like the roomier
+# screen and by density it is nearly as tight. Dividing pixels by millimetres
+# gets both right, and gets right a monitor neither of us has seen.
+#
+# So: Xft DPI is the panel's own density times UI_SCALE, and every pixel size
+# below is a 96-dpi baseline scaled by the same ratio. UI_SCALE is the one taste
+# knob — 1.0 renders a point at a true 1/72", and the 0.88 default is a notch
+# under that, sized so the 4K lands on the 144 dpi this was hand-tuned to.
+#
+# Density alone is still not enough, because it only says how big a thing ought
+# to be and never asks whether the screen can spare the room. Both panels here
+# are dense, and 0.88 of physical asks for 143 dpi on one and 119 on the other —
+# but 143 dpi buys the 4K a 27x15 inch desktop and 119 buys the laptop a 11x6
+# inch one. The same physical text size costs the small panel most of its
+# workspace and the big one nothing. Pixels are the budget: a screen with 768
+# rows cannot afford to spend them at the rate a screen with 2160 rows can.
+#
+# So the density figure is capped by MIN_WORKSPACE_INCHES — a floor on how tall
+# the desktop stays in logical inches, which is a ceiling on DPI. Density says
+# how big; pixel count says how big you can afford; the smaller wins. On the 4K
+# the cap is 270 dpi and never binds. On the laptop it binds at 96, which is
+# where a 1366x768 panel wants to live anyway.
+#
+# Usage: resolution [status|highest|fullhd|lowest|retier|--list] [--quiet]
 
 set -euo pipefail
 
 TIERS_ENABLED=${TIERS_ENABLED:-1}
 FULLHD_PIXELS=$((1920 * 1080))
+
+# Font size as a fraction of true physical scale, and the range it may land in.
+# The clamp is what keeps 640x480 usable: 640 px over 256 mm is 64 dpi, and text
+# that honest is unreadable, so the small end stops at 72 rather than following
+# the arithmetic all the way down.
+UI_SCALE=${UI_SCALE:-0.88}
+DPI_MIN=72
+DPI_MAX=240
+
+# The desktop never gets shorter than this many logical inches, whatever the
+# density works out to. Lower it to trade workspace for bigger text, raise it
+# for the reverse; on this laptop each 0.5" is worth about 6 dpi.
+MIN_WORKSPACE_INCHES=${MIN_WORKSPACE_INCHES:-8.0}
+
+# Panel bar, tray icon, dock and cursor pixel sizes at 96 dpi, scaled linearly
+# from there. Chosen to reproduce the old hand-written tiers: exactly at 72 dpi,
+# within a few pixels at 144.
+BASE_BAR=26
+BASE_ICON=16
+BASE_DOCK=48
+BASE_CURSOR=16
 
 QUIET=0
 ACTION=""
@@ -55,7 +105,7 @@ ACTION=""
 for arg in "$@"; do
     case $arg in
         --quiet|-q) QUIET=1 ;;
-        status|highest|fullhd|lowest|--list) ACTION=$arg ;;
+        status|highest|fullhd|lowest|retier|--list) ACTION=$arg ;;
         -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//;$d'; exit 0 ;;
         *) echo "resolution: unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -129,14 +179,49 @@ choose() {
         END { if (have) print mode, hz }'
 }
 
-# Panel and cursor sizes are pixels, so they get a tier per resolution band
-# rather than following anything automatically. panel-1 is the top bar (the one
-# holding the systray), panel-2 the dock; a missing one is skipped rather than
-# treated as an error, so this survives the panels being rearranged.
+# The physical width of $PRIMARY in millimetres, from the EDID xrandr prints at
+# the end of the output's `connected` line. Nothing at all when there is no EDID
+# to read it out of, which is a laptop panel behind a driver that doesn't
+# expose one, a KVM, or a monitor that reports 0mm x 0mm — all of which the
+# caller has to fall back for rather than divide by.
+physical_width_mm() {
+    awk -v out="$PRIMARY" '
+        $1 == out && $2 == "connected" {
+            for (i = 3; i < NF - 1; i++)
+                if ($i ~ /^[0-9]+mm$/ && $(i + 1) == "x" && $(i + 2) ~ /^[0-9]+mm$/) {
+                    mm = $i; sub(/mm$/, "", mm)
+                    if (mm + 0 > 0) print mm + 0
+                    exit
+                }
+            exit
+        }' <<<"$XRANDR_QUERY"
+}
+
+# "DPI BAR ICON DOCK CURSOR" for a mode $1 x $2 pixels on a screen $3 mm wide.
+tier_from_geometry() {
+    awk -v px="$1" -v py="$2" -v mm="$3" -v scale="$UI_SCALE" \
+        -v lo="$DPI_MIN" -v hi="$DPI_MAX" -v minin="$MIN_WORKSPACE_INCHES" \
+        -v bar="$BASE_BAR" -v icon="$BASE_ICON" -v dock="$BASE_DOCK" -v cur="$BASE_CURSOR" '
+        function round(x) { return int(x + 0.5) }
+        BEGIN {
+            dpi = px * 25.4 / mm * scale            # what the glass asks for
+            cap = py / minin                        # what the pixel budget allows
+            if (dpi > cap) dpi = cap
+            if (dpi < lo) dpi = lo
+            if (dpi > hi) dpi = hi
+            f = dpi / 96
+            print round(dpi), round(bar * f), round(icon * f), round(dock * f), round(cur * f)
+        }'
+}
+
+# Fallback for an output with no usable EDID: the old pixel-height bands. They
+# are wrong across monitors of different physical sizes — the whole reason the
+# geometry path above exists — but a screen with no EDID has told us nothing
+# better, and these are at least the sizes this ran with for a year.
 #   height >= 1800  4K and up
 #   height >= 1080  Full HD through 1440p
 #   below           the small end
-tier_for() {
+tier_for_height() {
     local height=$1
     if   (( height >= 1800 )); then echo "144 43 26 79 26"
     elif (( height >= 1080 )); then echo "96 26 16 48 16"
@@ -146,15 +231,31 @@ tier_for() {
 
 xf_try() { xfconf-query "$@" >/dev/null 2>&1 || true; }
 
+# Fit the desktop furniture to $1, a "WIDTHxHEIGHT" mode on $PRIMARY, and echo
+# the tier it used. panel-1 is the top bar (the one holding the systray),
+# panel-2 the dock; a missing one is skipped rather than treated as an error, so
+# this survives the panels being rearranged.
 apply_tier() {
-    (( TIERS_ENABLED )) || return 0
-    local dpi bar icon dock cursor
-    read -r dpi bar icon dock cursor <<<"$(tier_for "$1")"
-    xf_try -c xsettings    -p /Xft/DPI                   -s "$dpi"
-    xf_try -c xsettings    -p /Gtk/CursorThemeSize       -s "$cursor"
-    xf_try -c xfce4-panel  -p /panels/panel-1/size       -s "$bar"
-    xf_try -c xfce4-panel  -p /panels/panel-1/icon-size  -s "$icon"
-    xf_try -c xfce4-panel  -p /panels/panel-2/size       -s "$dock"
+    local mode=$1 width height mm tier dpi bar icon dock cursor
+    width=${mode%%x*}
+    height=${mode#*x}
+
+    mm=$(physical_width_mm)
+    if [[ -n $mm ]]; then
+        tier=$(tier_from_geometry "$width" "$height" "$mm")
+    else
+        tier=$(tier_for_height "$height")
+    fi
+    read -r dpi bar icon dock cursor <<<"$tier"
+
+    if (( TIERS_ENABLED )); then
+        xf_try -c xsettings    -p /Xft/DPI                   -s "$dpi"
+        xf_try -c xsettings    -p /Gtk/CursorThemeSize       -s "$cursor"
+        xf_try -c xfce4-panel  -p /panels/panel-1/size       -s "$bar"
+        xf_try -c xfce4-panel  -p /panels/panel-1/icon-size  -s "$icon"
+        xf_try -c xfce4-panel  -p /panels/panel-2/size       -s "$dock"
+    fi
+    echo "$tier"
 }
 
 # -s alone keeps an existing property's type; -n -t creates one that isn't
@@ -212,14 +313,14 @@ case $ACTION in
     highest|fullhd|lowest)
         target=$(choose "$ACTION")
         [[ -n $target ]] || { echo "resolution: $PRIMARY has no $ACTION mode" >&2; exit 1; }
-        mode=${target%% *}; rate=${target##* }; height=${mode#*x}
+        mode=${target%% *}; rate=${target##* }
 
         # Profile before xrandr, so xfsettingsd's copy already agrees by the
         # time the RandR change reaches it. The mode came out of xrandr's own
         # list, so there is no plausible way to persist one it will refuse.
         persist "$mode" "$rate"
         xrandr --output "$PRIMARY" --mode "$mode" --rate "$rate" --scale 1x1 --primary
-        apply_tier "$height"
+        apply_tier "$mode" >/dev/null
 
         (( QUIET )) || {
             command -v notify-send >/dev/null && notify-send \
@@ -227,5 +328,19 @@ case $ACTION in
                 "$(label_of "$ACTION")" "$PRIMARY — $mode @ ${rate} Hz"
         }
         echo "$PRIMARY: $mode @ ${rate} Hz ($(label_of "$ACTION"))"
+        ;;
+
+    # Re-fit the UI to the mode that is already set, without touching it. This
+    # is the undock case: pulling the cable is a layout change nobody ran
+    # `resolution` for, so the DPI picked for the monitor that just left stays
+    # applied to the one still here. resolution-tray.py calls this on every
+    # RandR event; it is idempotent, so the extra one after a preset switch
+    # rewrites the same five values.
+    retier)
+        active=$(current_mode)
+        [[ -n $active ]] || { echo "$PRIMARY is off"; exit 0; }
+        mode=${active%% *}
+        read -r dpi bar icon dock cursor <<<"$(apply_tier "$mode")"
+        (( QUIET )) || echo "$PRIMARY: $mode — ${dpi} dpi, bar $bar, icons $icon, dock $dock, cursor $cursor"
         ;;
 esac

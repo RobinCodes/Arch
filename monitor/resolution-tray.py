@@ -12,6 +12,12 @@ xrandr, and moving font DPI and panel sizes to match. This only reads that
 script and calls it, so the icon, the CLI and xfce4-display-settings can't
 disagree about what's set.
 
+It also calls `resolution retier` on every screen change, which is the half of
+the job no menu click covers. Unplugging a monitor is a layout change nobody
+ran `resolution` for, so the DPI chosen for the screen that just left stays
+applied to the one still here — and between a 27" 4K and an 11.6" laptop panel
+that is a factor of two in how big text lands on the glass.
+
 The preset list is cached rather than re-read per click. It only changes when
 the hardware does, and RandR says so — so the menu is seeded from a cache that
 a screen change invalidates, and opening it costs nothing."""
@@ -89,6 +95,7 @@ class ResolutionTray:
         self.icon.connect("popup-menu", self.on_popup_menu)
 
         self.reload()
+        self.retier()
         self.icon.set_visible(True)
 
         # Catches a mode set from the CLI or the settings dialog as well as our
@@ -119,6 +126,19 @@ class ResolutionTray:
             f"Screen resolution: {pretty(*active)} ({LABELS[self.current]})"
         )
 
+    def retier(self):
+        """Re-fit fonts, panels and the cursor to whichever screen is primary now.
+
+        Fire-and-forget: this is cosmetic, it can't fail in a way worth a dialog,
+        and it must not block the event handler it runs from. Idempotent too, so
+        the one that follows our own preset switch just rewrites what that
+        switch already wrote.
+        """
+        try:
+            subprocess.Popen([RESOLUTION_BIN, "retier", "--quiet"])
+        except OSError:
+            pass
+
     def on_screen_changed(self, _screen):
         if self._reload_timer is not None:
             GLib.source_remove(self._reload_timer)
@@ -127,6 +147,7 @@ class ResolutionTray:
     def on_reload_timer(self):
         self._reload_timer = None
         self.reload()
+        self.retier()
         return GLib.SOURCE_REMOVE
 
     def apply(self, key):
