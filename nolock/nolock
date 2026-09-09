@@ -1,39 +1,54 @@
 #!/usr/bin/env bash
 # nolock — skip the password prompt when the laptop wakes, lid or sleep.
 #
-# Five separate XFCE switches can each put a lock screen in front of the
-# session, and every one of them defaults to locking, so turning off any one on
-# its own still leaves you typing a password:
+# On XFCE this had to turn off five switches across two daemons, and the one
+# that took longest to find was the lid pair — because closing the lid never
+# slept the machine, it locked it directly, so none of the sleep-related
+# switches ever got a say.
 #
-#   xfce4-power-manager  lock-screen-suspend-hibernate
-#                        locks the screen just before it starts a suspend
-#   xfce4-screensaver    /lock/sleep-activation
-#                        locks on logind's PrepareForSleep signal
-#   xfce4-screensaver    /lock/saver-activation/enabled
-#                        locks when the idle screensaver kicks in — which is
-#                        what actually catches you on an idle suspend, since
-#                        the saver activates on the way down
-#   xfce4-power-manager  lid-action-on-ac
-#   xfce4-power-manager  lid-action-on-battery
-#                        what closing the lid does at all — and their default,
-#                        3, *is* "lock screen"
+# Under niri the shape is different and smaller. niri does not lock; noctalia
+# does, and logind decides what the lid means. That leaves three switches that
+# can put a password prompt in front of you, all of them noctalia's:
 #
-# The lid pair is the one that took a while to find, because none of the three
-# above are wrong: they gate locking *around a sleep*, and closing the lid on
-# this machine never sleeps. xfce4-power-manager holds a logind
-# handle-lid-switch inhibitor, so it decides what a lid close means rather than
-# logind, and left alone it decides "lock the screen" — no suspend, no
-# PrepareForSleep, no screensaver, nothing for the other three to veto. Hence a
-# laptop that locked on every lid close while nolock reported itself on.
+#   lockscreen.lock_before_suspend
+#           The direct heir to xfce4-screensaver's /lock/sleep-activation, and
+#           the one that actually catches you: noctalia holds a logind sleep
+#           *delay* inhibitor ("Lock before sleep" in `systemd-inhibit --list`)
+#           and raises the lock screen on the way down. Default true.
+#   idle.behavior.lock.enabled
+#   idle.behavior.lock-and-suspend.enabled
+#           Lock after an idle timeout, with and without suspending. Both ship
+#           disabled, so on a stock install they cost nothing — they are here
+#           so that turning one on later does not silently defeat nolock.
 #
-# On is DPMS (0): the display goes off, the session keeps running, and opening
-# the lid comes straight back. Off restores 3.
+# lockscreen.enabled is deliberately left alone. It is the master switch, and
+# with it on Super+Alt+L still locks on demand while nolock is on — exactly the
+# reasoning that kept /lock/enabled untouched in the XFCE version.
 #
-# /lock/enabled is deliberately left alone: it is the master switch, and with
-# it on, Ctrl+Alt+L still locks on demand even while nolock is on.
+# WHAT DOES NOT TRANSFER: THE LID
 #
-# The state is the xfconf values themselves rather than a file beside them, so
-# it survives a reboot and can't drift from what XFCE is actually doing. The
+# The lid pair has no equivalent here. xfce4-power-manager held a logind
+# handle-lid-switch inhibitor and decided for itself what a lid close meant,
+# which is why it could be told "blank the screen" instead of "lock". Nothing
+# in this session takes that inhibitor, so the lid is logind's again, and
+# logind's HandleLidSwitch lives in /etc/systemd/logind.conf — root-owned
+# system configuration, not a per-user toggle. Changing it is a different kind
+# of act from flipping a setting in your own session, so nolock reports it and
+# does not touch it. With lock_before_suspend off, a lid close still suspends
+# and still comes back without asking, which is the outcome that was wanted.
+#
+# WHY THERE ARE FIVE COLUMNS BELOW AND NOT FOUR
+#
+# The XFCE version got away with one value doing double duty: for all five of
+# its keys, the value meaning "this would lock" was also the compiled-in
+# default, so an unset key read as locking and restored to the value it would
+# have had anyway. That coincidence does not hold here. lock_before_suspend
+# defaults to true (locking) and both idle behaviours default to false (not
+# locking), so "what does unset mean" and "what do I write to make it lock
+# again" are now genuinely different questions and get a column each.
+#
+# The state is the settings themselves rather than a file beside them, so it
+# survives a reboot and can't drift from what noctalia is actually doing. The
 # file this does keep is a snapshot of the pre-nolock values, so `off` restores
 # what was there instead of assuming the defaults.
 #
@@ -41,29 +56,17 @@
 
 set -euo pipefail
 
+SRC="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SETTING="$SRC/noctalia-setting.py"
+
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nolock"
 SAVED="$STATE_DIR/saved"
 
-# channel<TAB>property<TAB>type<TAB>nolock value<TAB>locking value
-#
-# The locking value does double duty: it is the value that means "this key
-# would lock", and it is what `off` writes to put the key back. Those can be
-# the same column because for all five it is also the compiled-in default the
-# key carries while unset, so an unset key reads as locking and restores to the
-# value it would have had anyway.
-#
-# That is what lets one rule — a key locks when its effective value equals its
-# locking value — cover both a bool defaulting to true and a lid action that is
-# a seven-member enum (0 DPMS, 1 suspend, 2 hibernate, 3 lock screen, 4
-# nothing, 5 hybrid sleep, 6 shutdown) where only 3 locks. It also means a lid
-# set to suspend by hand reads as not-locking and is left alone by `on`, rather
-# than being flattened to DPMS for no reason.
+# table<TAB>key<TAB>nolock value<TAB>locking value<TAB>default
 KEYS=(
-	"xfce4-power-manager	/xfce4-power-manager/lock-screen-suspend-hibernate	bool	false	true"
-	"xfce4-screensaver	/lock/sleep-activation	bool	false	true"
-	"xfce4-screensaver	/lock/saver-activation/enabled	bool	false	true"
-	"xfce4-power-manager	/xfce4-power-manager/lid-action-on-ac	uint	0	3"
-	"xfce4-power-manager	/xfce4-power-manager/lid-action-on-battery	uint	0	3"
+	"lockscreen	lock_before_suspend	false	true	true"
+	"idle.behavior.lock	enabled	false	true	false"
+	"idle.behavior.lock-and-suspend	enabled	false	true	false"
 )
 
 quiet=false
@@ -73,16 +76,11 @@ die() {
 	exit 1
 }
 
-raw() { # channel property -> the value, or "unset"
-	local value
-	if value=$(xfconf-query -c "$1" -p "$2" 2>/dev/null); then
-		echo "$value"
-	else
-		echo unset
-	fi
+raw() { # table key -> the value, or "unset"
+	python3 "$SETTING" get "$1" "$2" 2>/dev/null || echo unset
 }
 
-effective() { # channel property locking-value -> the value the daemon acts on
+effective() { # table key default -> the value noctalia acts on
 	local value
 	value=$(raw "$1" "$2")
 	if [ "$value" = unset ]; then
@@ -92,48 +90,40 @@ effective() { # channel property locking-value -> the value the daemon acts on
 	fi
 }
 
-locks() { # channel property locking-value -> 0 if this key would lock the screen
-	[ "$(effective "$1" "$2" "$3")" = "$3" ]
+locks() { # table key locking-value default -> 0 if this key would lock
+	[ "$(effective "$1" "$2" "$4")" = "$3" ]
 }
 
-type_of() { # channel property -> bool|uint, from the table above
-	local channel property type rest
-	while IFS=$'\t' read -r channel property type rest; do
-		if [ "$channel" = "$1" ] && [ "$property" = "$2" ]; then
-			echo "$type"
-			return 0
-		fi
-	done < <(printf '%s\n' "${KEYS[@]}")
-	die "no type known for $1 $2"
-}
-
-set_value() { # channel property type value
-	xfconf-query -c "$1" -p "$2" --create --type "$3" --set "$4" >/dev/null
-	# Read back rather than trusting the write: these keys are bound to
-	# running daemons that can write their own copy over the top, and a
-	# restore that half-lands leaves a laptop that doesn't lock while nolock
-	# reports itself off.
+del_value() { # table key — back to noctalia's default
+	python3 "$SETTING" del "$1" "$2"
 	local now
 	now=$(raw "$1" "$2")
-	[ "$now" = "$4" ] || die "$1 $2 reads $now after being set to $4"
+	[ "$now" = unset ] || die "$1.$2 still reads $now after being unset"
 }
 
-restore_locking() {
-	# Writes the locking value rather than removing the property with --reset,
-	# which would be the tidier way back to a shipped default but isn't
-	# reliable: xfce4-power-manager binds its keys both ways, so removing the
-	# property makes the daemon write its in-memory copy — still the nolock
-	# value — straight back. That failure is silent and points the wrong way,
-	# leaving a laptop that no longer locks after nolock was turned off. An
-	# explicit write is the same value the default would have given, and it
-	# sticks.
-	set_value "$1" "$2" "$(type_of "$1" "$2")" "$3"
+set_value() { # table key value
+	python3 "$SETTING" set "$1" "$2" "$3"
+	# Read back rather than trusting the write: noctalia owns this file and
+	# rewrites it whenever a setting changes in its UI, and a restore that
+	# half-lands leaves a laptop that doesn't lock while nolock reports itself
+	# off. Same argument as the XFCE version's read-back, different owner.
+	local now
+	now=$(raw "$1" "$2")
+	[ "$now" = "$3" ] || die "$1.$2 reads $now after being set to $3"
+}
+
+# Tell the running shell to pick the file up. Without this the change is real
+# but does not take effect until noctalia is restarted, which is precisely the
+# gap that makes a toggle feel broken.
+reload() {
+	command -v noctalia >/dev/null 2>&1 || return 0
+	noctalia msg config-reload >/dev/null 2>&1 || true
 }
 
 state() {
-	local channel property type nolock_value lock_value
-	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
-		if locks "$channel" "$property" "$lock_value"; then
+	local table key nolock_value lock_value default
+	while IFS=$'\t' read -r table key nolock_value lock_value default; do
+		if locks "$table" "$key" "$lock_value" "$default"; then
 			echo off
 			return
 		fi
@@ -144,51 +134,62 @@ state() {
 snapshot() {
 	# Per key rather than all-or-nothing on the file existing, so a key added
 	# to the table above is recorded the first time it is turned off even
-	# though the file is already there from an earlier `on` — without that,
-	# the lid pair would have been switched to DPMS with nothing saying what
-	# to put back. Keys already recorded are left alone: re-recording would
-	# overwrite the originals with the values nolock itself just wrote.
+	# though the file is already there from an earlier `on`. Keys already
+	# recorded are left alone: re-recording would overwrite the originals with
+	# the values nolock itself just wrote.
 	mkdir -p "$STATE_DIR"
-	local channel property type nolock_value lock_value
-	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
-		if [ -e "$SAVED" ] && cut -f1,2 "$SAVED" | grep -qxF "$channel	$property"; then
+	local table key nolock_value lock_value default
+	while IFS=$'\t' read -r table key nolock_value lock_value default; do
+		if [ -e "$SAVED" ] && cut -f1,2 "$SAVED" | grep -qxF "$table	$key"; then
 			continue
 		fi
-		printf '%s\t%s\t%s\n' "$channel" "$property" "$(raw "$channel" "$property")" >>"$SAVED"
+		printf '%s\t%s\t%s\n' "$table" "$key" "$(raw "$table" "$key")" >>"$SAVED"
 	done < <(printf '%s\n' "${KEYS[@]}")
 }
 
 enable() {
 	snapshot
-	local channel property type nolock_value lock_value
-	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
+	local table key nolock_value lock_value default
+	while IFS=$'\t' read -r table key nolock_value lock_value default; do
 		# Only the keys actually standing in the way, so anything already
 		# harmless keeps whatever value it was given.
-		if locks "$channel" "$property" "$lock_value"; then
-			set_value "$channel" "$property" "$type" "$nolock_value"
+		if locks "$table" "$key" "$lock_value" "$default"; then
+			set_value "$table" "$key" "$nolock_value"
 		fi
 	done < <(printf '%s\n' "${KEYS[@]}")
+	reload
 }
 
 disable() {
-	local channel property type nolock_value lock_value value saved
-	while IFS=$'\t' read -r channel property type nolock_value lock_value; do
+	local table key nolock_value lock_value default saved
+	while IFS=$'\t' read -r table key nolock_value lock_value default; do
 		saved=unset
 		if [ -e "$SAVED" ]; then
 			# Falls through to the locking value when the key isn't in the
-			# file — the keys were flipped by hand, the state directory was
+			# file — the settings were changed by hand, the state directory was
 			# cleared, or the table grew since the snapshot was taken.
-			saved=$(awk -F'\t' -v c="$channel" -v p="$property" \
-				'$1 == c && $2 == p { print $3; exit }' "$SAVED")
+			saved=$(awk -F'\t' -v t="$table" -v k="$key" \
+				'$1 == t && $2 == k { print $3; exit }' "$SAVED")
 			[ -n "$saved" ] || saved=unset
 		fi
 		if [ "$saved" = unset ]; then
-			restore_locking "$channel" "$property" "$lock_value"
+			# The key was not set before nolock touched it, so putting it back
+			# means removing it, not writing a value over it.
+			#
+			# The XFCE version wrote the locking value here instead, and could:
+			# for all five of its keys the locking value *was* the shipped
+			# default, so the two were the same act. Here they are not.
+			# lock_before_suspend defaults to true, so deleting it restores the
+			# lock — but both idle behaviours default to false, and writing
+			# true over them would arm an idle lock this machine never had.
+			# Restoring means restoring, not "make everything lock".
+			del_value "$table" "$key"
 		else
-			set_value "$channel" "$property" "$type" "$saved"
+			set_value "$table" "$key" "$saved"
 		fi
 	done < <(printf '%s\n' "${KEYS[@]}")
 	rm -f "$SAVED"
+	reload
 }
 
 notify() {
@@ -208,7 +209,17 @@ notify() {
 	fi
 }
 
-command -v xfconf-query >/dev/null || die "xfconf-query not found"
+# What the lid currently does, for `status`. Reported and never changed — see
+# the header. Unset means logind's own default, which is suspend.
+lid_action() {
+	local value
+	value=$(systemd-analyze cat-config systemd/logind.conf 2>/dev/null \
+		| grep -iE '^[[:space:]]*HandleLidSwitch=' | tail -1 | cut -d= -f2)
+	printf '%s\n' "${value:-suspend (logind default)}"
+}
+
+[ -x "$SETTING" ] || die "missing helper: $SETTING"
+command -v python3 >/dev/null || die "python3 not found"
 
 action=status
 for arg in "$@"; do
@@ -226,7 +237,14 @@ done
 
 case "$action" in
 status)
-	state
+	now=$(state)
+	echo "$now"
+	if ! $quiet; then
+		echo "  lid close:  $(lid_action)   (system setting, not managed here)"
+		while IFS=$'\t' read -r table key nolock_value lock_value default; do
+			printf '  %-46s %s\n' "$table.$key" "$(effective "$table" "$key" "$default")"
+		done < <(printf '%s\n' "${KEYS[@]}")
+	fi
 	exit 0
 	;;
 toggle)

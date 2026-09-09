@@ -31,6 +31,7 @@ PyGObject."""
 import glob
 import os
 import subprocess
+import sys
 import warnings
 
 import cairo
@@ -40,12 +41,22 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import tray  # noqa: E402
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 POLL_INTERVAL_MS = 5000
 LOW_PERCENT = 20
 CRITICAL_PERCENT = 10
-FALLBACK_ICON_SIZE = 16
+# The panel used to hand its icon size over through size-changed. A
+# StatusNotifierItem has no such conversation — the bar takes the picture and
+# scales it — so the icon is drawn once at a size big enough to survive being
+# scaled down to whatever the bar is using. 32 rather than 16 because a bar at
+# scale 2, or simply a taller bar, would otherwise show a blurry upscale of a
+# 16px bitmap.
+ICON_SIZE = 32
+FALLBACK_ICON_SIZE = ICON_SIZE
 
 # Share of the icon's height the digits get. Charging gives up the top of the
 # box to the bolt and an active profile the bottom to its bar; all three must
@@ -65,7 +76,10 @@ PERFORMANCE_RGB = (0.78, 0.55, 0.95)
 DARK_PANEL_RGB = (0.93, 0.93, 0.93)
 
 POWER_SUPPLY_DIR = "/sys/class/power_supply"
-SETTINGS_BIN = "xfce4-power-manager-settings"
+# noctalia's settings window. The XFCE power manager it used to open does not
+# exist here, and nothing in this session owns the same set of knobs — the four
+# profiles in this menu are this repo's own, written straight to sysfs.
+SETTINGS_ARGV = ("noctalia", "msg", "settings-open")
 
 # Resolved from this file so the Scripts folder stays movable.
 POWER_PROFILE_BIN = os.path.join(
@@ -215,25 +229,24 @@ def format_duration(seconds):
 
 
 def panel_is_dark():
+    """Whether the bar is painting itself dark.
+
+    Asked of noctalia rather than of xfconf, which is the same question to a
+    different owner. The GTK theme is still not a reliable answer: the bar
+    picks its own palette and a GTK app under Wayland has no way to read it.
+    """
     try:
         out = subprocess.run(
-            ["xfconf-query", "-c", "xfce4-panel", "-p", "/panels/dark-mode"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (subprocess.CalledProcessError, OSError):
-        return False
-    return out == "true"
+            ["noctalia", "msg", "theme-mode-get"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip().lower()
+    except (subprocess.SubprocessError, OSError):
+        return True  # noctalia ships dark; guessing dark is the safer miss
+    return out == "dark"
 
 
 def default_fg_rgb():
-    """The colour the panel most likely paints its own text in.
-
-    In dark mode the panel uses its own dark variant regardless of the GTK
-    theme, so the theme's foreground can't be trusted; otherwise the panel
-    follows the theme and that foreground is the right match.
-    """
+    """The colour the bar most likely paints its own text in."""
     if panel_is_dark():
         return DARK_PANEL_RGB
     colour = Gtk.Label().get_style_context().get_color(Gtk.StateFlags.NORMAL)
@@ -397,7 +410,6 @@ class BatteryTray:
         self.device = find_battery()
         self.size = FALLBACK_ICON_SIZE
         self.default_rgb = default_fg_rgb()
-        self.menu = None
         self.profile = read_profile()
         self.auto = read_auto()
         self._switching = None
@@ -407,11 +419,10 @@ class BatteryTray:
         # the AC line can have moved while nothing was running to notice.
         self._on_ac = None
 
-        self.icon = Gtk.StatusIcon()
-        self.icon.set_title("Battery")
-        self.icon.connect("size-changed", self.on_size_changed)
-        self.icon.connect("activate", self.on_click)
-        self.icon.connect("popup-menu", self.on_popup_menu)
+        self.tray = tray.Tray(
+            "battery-tray", "battery-symbolic", "Battery",
+            category=tray.CATEGORY.HARDWARE,
+        )
         self.refresh()
         GLib.timeout_add(POLL_INTERVAL_MS, self.on_poll)
         # sysfs doesn't survive a reboot but the state file does, so at login
@@ -419,14 +430,6 @@ class BatteryTray:
         # the AC line, which may well have changed while this machine was off.
         self.reapply_profile()
         self.check_ac()
-
-    def on_size_changed(self, _icon, size):
-        # The panel hands out its icon size here, and again whenever the panel
-        # is resized; redraw at the new resolution instead of letting the tray
-        # scale a stale pixbuf.
-        self.size = max(FALLBACK_ICON_SIZE, size)
-        self.refresh()
-        return True
 
     def refresh(self):
         # Picked up from the files rather than held in memory, so a profile or
@@ -439,15 +442,17 @@ class BatteryTray:
             # machine; look again rather than staying blank forever.
             self.device = find_battery()
         if self.device is None:
-            self.icon.set_visible(False)
+            self.tray.set_visible(False)
             return
+        self.tray.set_visible(True)
 
         try:
             state = BatteryState(self.device)
         except READ_ERRORS:
             return
-        self.icon.set_from_pixbuf(
-            render_icon(self.size, state, self.default_rgb, self.profile)
+        self.tray.set_pixbuf(
+            render_icon(self.size, state, self.default_rgb, self.profile),
+            state.describe(),
         )
         lines = [state.describe()]
         if self.profile != DEFAULT_PROFILE:
@@ -455,8 +460,11 @@ class BatteryTray:
             # performance nobody selected explains itself on hover.
             reason = " — automatic on AC" if ac_engaged() else ""
             lines.append(f"Power: {PROFILE_LABELS[self.profile]}{reason}")
-        self.icon.set_tooltip_text("\n".join(lines))
-        self.icon.set_visible(True)
+        self.tray.set_tooltip(" · ".join(lines))
+        # The menu carries the live profile state, so it is rebuilt with the
+        # icon rather than on click: a StatusNotifierItem menu is sent over
+        # D-Bus ahead of being shown, and there is no open event to rebuild on.
+        self.tray.set_menu(self.build_menu())
 
     def check_ac(self):
         """Hand every plug and unplug to power-profile, which decides what it
@@ -508,7 +516,7 @@ class BatteryTray:
         menu.append(follow)
         menu.append(Gtk.SeparatorMenuItem())
 
-        settings = Gtk.MenuItem(label="Power Manager Settings")
+        settings = Gtk.MenuItem(label="noctalia Settings")
         settings.connect("activate", self.on_settings)
         menu.append(settings)
         menu.append(Gtk.SeparatorMenuItem())
@@ -517,7 +525,6 @@ class BatteryTray:
         quit_item.connect("activate", lambda _item: Gtk.main_quit())
         menu.append(quit_item)
 
-        menu.show_all()
         return menu
 
     def on_profile_toggled(self, item, name):
@@ -604,25 +611,13 @@ class BatteryTray:
 
     def on_settings(self, _item):
         try:
-            subprocess.Popen([SETTINGS_BIN])
+            subprocess.Popen(SETTINGS_ARGV)
         except OSError:
             pass
 
-    def show_menu(self, button, time):
-        # Rebuilt per click so it can't outlive the icon's position.
-        self.menu = self.build_menu()
-        self.menu.popup(None, None, Gtk.StatusIcon.position_menu, self.icon,
-                        button, time)
-
-    def on_click(self, _icon):
-        self.refresh()
-        self.show_menu(1, Gtk.get_current_event_time())
-
-    def on_popup_menu(self, _icon, button, time):
-        self.show_menu(button, time)
-
 
 def main():
+    GLib.set_prgname("battery-tray")
     if find_battery() is None:
         raise SystemExit("no system battery found under /sys/class/power_supply")
     BatteryTray()

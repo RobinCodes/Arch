@@ -29,6 +29,34 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
+# --- Is LightDM even the display manager any more? -------------------------
+#
+# This machine moved to greetd + noctalia-greeter, and under that stack nothing
+# reads /etc/lightdm at all: the drop-in below would be written, be valid, and
+# be ignored forever. Refusing is the honest outcome, because a silent no-op is
+# indistinguishable from a fix that did not work.
+#
+# The replacement is one IPC call, not a script. `noctalia msg greeter-sync`
+# pushes the monitor layout and the colour scheme to the greeter, and
+# monitor/resolution now calls it on every mode change — so the login screen
+# follows the session for the same "one source of truth" reason this script's
+# header argues for, with none of the privilege-dropping this needed.
+DM=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)
+if [[ $DM != */lightdm.service ]]; then
+    echo "LightDM is not the display manager here (found: ${DM##*/})." >&2
+    echo >&2
+    echo "Nothing reads /etc/lightdm on this system, so installing these hooks" >&2
+    echo "would change nothing. Under greetd + noctalia-greeter the equivalent is:" >&2
+    echo >&2
+    echo "    noctalia msg greeter-sync" >&2
+    echo >&2
+    echo "which monitor/resolution already runs whenever the mode or scale changes." >&2
+    echo "Re-run this only if you switch back to LightDM." >&2
+    echo >&2
+    echo "Pass FORCE_LIGHTDM=1 to install anyway." >&2
+    [[ ${FORCE_LIGHTDM:-} == 1 ]] || exit 1
+fi
+
 HELPER=/usr/local/libexec/monitor-greeter
 DROPIN=/etc/lightdm/lightdm.conf.d/60-monitor.conf
 GREETER_DROPIN=/etc/lightdm/lightdm-gtk-greeter.conf.d/60-monitor.conf

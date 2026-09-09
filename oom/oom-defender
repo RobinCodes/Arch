@@ -175,6 +175,7 @@ DEFAULTS = {
 
 NOTIFY_SEND = "/usr/bin/notify-send"
 XPROP = "/usr/bin/xprop"
+NIRI = "/usr/bin/niri"
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 
@@ -573,10 +574,20 @@ def run_capture(argv, env, timeout=2.0, limit=4096):
 class Attention:
     """The window the user is focused on, and the processes behind it.
 
-    X is the only authority on what has focus, so this asks the window manager
+    The compositor is the only authority on what has focus, so this asks it
     over the same session environment the notifications use. Everything about
-    it is best-effort: no X, no xprop, no _NET_WM_PID on the focused window,
-    and the group is simply empty, which returns victim choice to size alone.
+    it is best-effort: no compositor, no answer, or a window that reports no
+    pid, and the group is simply empty, which returns victim choice to size
+    alone.
+
+    Two ways to ask, picked per call from the session environment:
+
+      niri     `niri msg focused-window`, which hands over the pid directly.
+               Wayland has no root window and no _NET_ACTIVE_WINDOW to read,
+               so there is no protocol-level way to do this — every compositor
+               answers on its own IPC or not at all. That is the whole reason
+               this is a branch rather than one command.
+      X11      the original two-step xprop walk, kept working for an X session.
     """
 
     __slots__ = ("cfg", "pid", "group", "checked", "warned")
@@ -610,6 +621,39 @@ class Attention:
         env = dict(session[3])
         env.setdefault("XAUTHORITY", os.path.join(env.get("HOME", "/"), ".Xauthority"))
 
+        if env.get("NIRI_SOCKET"):
+            return self._focused_pid_niri(env)
+        return self._focused_pid_x11(env)
+
+    def _focused_pid_niri(self, env):
+        """The pid out of `niri msg focused-window`.
+
+        The plain text form is parsed rather than --json on purpose: the field
+        wanted is one integer on a line of its own, and a json import is a
+        module load in a daemon that mlockall()s itself and is written not to
+        allocate when the machine is out of memory.
+
+        Root can open the socket regardless of its mode, so there is no
+        privilege drop here — same as the xprop path, which relies on
+        XAUTHORITY rather than on being the user.
+        """
+        out = run_capture([NIRI, "msg", "focused-window"], env)
+        if not out:
+            if not self.warned:
+                self.warned = True
+                log(f"focus: {NIRI} gave nothing — ranking by size alone")
+            return None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("PID:"):
+                try:
+                    return int(line.partition(":")[2].strip())
+                except ValueError:
+                    return None
+        # "No window is focused." — the overview, or an empty workspace.
+        return None
+
+    def _focused_pid_x11(self, env):
         # _NET_ACTIVE_WINDOW(WINDOW): window id # 0x3200017, 0x0
         out = run_capture([XPROP, "-root", "_NET_ACTIVE_WINDOW"], env)
         if not out:
@@ -683,9 +727,20 @@ _session = None  # (uid, gid, username, env) of the graphical session, cached
 
 # Session owners, best first. Any of them carries the environment we need; the
 # ordering just prefers the process least likely to be a transient child.
-_SESSION_OWNERS = ("xfce4-session", "xfsettingsd", "xfce4-panel", "xfdesktop",
+#
+# niri first, because on this machine it is the session and the XFCE names
+# below no longer exist. They are kept because nothing about this daemon is
+# specific to either desktop, and a session it does not recognise costs it
+# both notifications and focus — the two things it most needs to be right
+# about when it is deciding what to kill.
+_SESSION_OWNERS = ("niri", "niri-session", "noctalia",
+                   "xfce4-session", "xfsettingsd", "xfce4-panel", "xfdesktop",
                    "xfwm4", "xfconfd", "dbus-daemon")
-_SESSION_ENV = ("DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY",
+# WAYLAND_DISPLAY and NIRI_SOCKET join DISPLAY here for the same reason: this
+# is the set of variables that has to be carried from the session into a root
+# process so it can talk back to that session.
+_SESSION_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "NIRI_SOCKET",
+                "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY",
                 "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH")
 
 
@@ -726,7 +781,12 @@ def find_session(force=False):
                 key = key.decode("utf-8", "replace")
                 if key in _SESSION_ENV:
                     env[key] = value.decode("utf-8", "replace")
-        if "DISPLAY" not in env or "DBUS_SESSION_BUS_ADDRESS" not in env:
+        # Either display protocol will do. Requiring DISPLAY specifically was
+        # what made this return None outright under a Wayland session, which
+        # cost the notifications as well as the focus.
+        if "DBUS_SESSION_BUS_ADDRESS" not in env:
+            continue
+        if "DISPLAY" not in env and "WAYLAND_DISPLAY" not in env:
             continue
 
         rank = _SESSION_OWNERS.index(comm)
@@ -1078,8 +1138,8 @@ def print_status(cfg):
         print(f"focus    {comm_of.get(attention.pid, '?')} [{attention.pid}] "
               f"and {max(0, len(attention.group) - 1)} process(es) behind it")
     else:
-        print("focus    unknown (no X session, or the focused window sets no "
-              "PID) — ranking by size alone")
+        print("focus    unknown (no graphical session, or nothing is "
+              "focused) — ranking by size alone")
     print()
 
     print(f"next in line (under {cfg['min_victim_mb']:.0f} MB is never touched; "

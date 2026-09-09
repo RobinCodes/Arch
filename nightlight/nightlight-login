@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# Applies the scheduled intensity as soon as the XFCE session comes up, so the
+# Applies the scheduled intensity as soon as the session comes up, so the
 # desktop is already warm on arrival. Without this the first colour change came
-# from the timer's OnStartupSec=30 tick, i.e. ~40s into the session, because the
-# X server starts with neutral gamma ramps and nothing else sets them.
+# from the timer's OnStartupSec=30 tick, i.e. ~40s in, because a fresh session
+# starts with neutral gamma and nothing else sets it.
 #
-# Runs from ~/.config/autostart/nightlight-login.desktop, which inherits the
-# real session DISPLAY/XAUTHORITY -- unlike the systemd timer, which arms before
-# xfce4-session imports them.
+# Runs from ~/.config/autostart/nightlight-login.desktop. That file used to
+# carry OnlyShowIn=XFCE, which meant systemd's xdg-autostart generator skipped
+# it outright under niri -- the unit existed and was never allowed to run. The
+# line is gone; niri --session activates xdg-desktop-autostart.target like any
+# other session, so the entry is honoured now.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# xfsettingsd's startup display pass can reconfigure the CRTC and wipe the gamma
-# ramp we just set (same reason apply-touchpad.sh applies twice), so re-assert
-# once it has settled. nightlight-auto is idempotent -- redshift -P resets the
-# ramp before each set -- so the second pass is free of side effects.
+# Applied twice, for a reason that survived the port with a different culprit.
+# On X11 it was xfsettingsd's startup display pass reconfiguring the CRTC and
+# wiping the ramp. Here it is the shell: noctalia implements wlr-gamma-control
+# itself, and if it takes the control while starting up, whatever it sets
+# replaces what we set. Re-asserting once it has settled costs nothing --
+# nightlight-auto is idempotent, and gamma-apply swaps holders new-first so the
+# second pass does not flicker.
 "$DIR/nightlight-auto"
 sleep 3
 "$DIR/nightlight-auto"

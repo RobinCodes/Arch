@@ -12,17 +12,49 @@
 #
 # --auto is how nightlight-auto sets the value without arming an override.
 # --mode only writes the setting; run nightlight-auto to apply it right away.
+#
+# WHAT CHANGED IN THE WAYLAND PORT
+#
+# The schedule, the override and the two modes are exactly as they were. Two
+# things underneath them moved:
+#
+#   * Applying a temperature goes through ./gamma-apply, which owns the
+#     question of what is holding the ramp. On Wayland something has to stay
+#     alive to hold it — see that file's header — where on X11 redshift could
+#     set it and exit.
+#   * The current value lives in $KELVIN_FILE rather than in redshift.conf.
+#     That file was only ever a convenient place to keep a number, and with
+#     redshift out of the picture on Wayland it would have been a config for a
+#     program nothing runs. It is still read once, as a fallback, so an
+#     existing install carries its value across instead of snapping to neutral.
 set -e
-CONF="$HOME/.config/redshift/redshift.conf"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nightlight"
 OVERRIDE="$STATE/override-until"
 MODE_FILE="$STATE/mode"
+KELVIN_FILE="$STATE/kelvin"
+LEGACY_CONF="$HOME/.config/redshift/redshift.conf"
+GAMMA_APPLY="$(cd "$(dirname "$0")" && pwd)/gamma-apply"
+
+NEUTRAL=6500
+PER_PERCENT=40
 
 current_temp() {
-    grep -oP '(?<=^temp-day=)\d+' "$CONF"
+    local temp
+    temp=$(cat "$KELVIN_FILE" 2>/dev/null)
+    if [[ "$temp" =~ ^[0-9]+$ ]]; then
+        echo "$temp"
+        return
+    fi
+    # One-time migration from the redshift.conf era.
+    temp=$(grep -oP '(?<=^temp-day=)\d+' "$LEGACY_CONF" 2>/dev/null)
+    if [[ "$temp" =~ ^[0-9]+$ ]]; then
+        echo "$temp"
+        return
+    fi
+    echo "$NEUTRAL"
 }
 
-# Anything unset or unrecognised means auto, so a missing//corrupt state file
+# Anything unset or unrecognised means auto, so a missing/corrupt state file
 # fails back to the scheduled behaviour rather than freezing the screen.
 current_mode() {
     local m
@@ -47,7 +79,7 @@ next_boundary() {
     fi
 }
 
-if [ "$1" = "--mode" ]; then
+if [ "${1:-}" = "--mode" ]; then
     shift
     if [ $# -eq 0 ]; then
         current_mode
@@ -66,14 +98,14 @@ if [ "$1" = "--mode" ]; then
 fi
 
 auto=0
-if [ "$1" = "--auto" ]; then
+if [ "${1:-}" = "--auto" ]; then
     auto=1
     shift
 fi
 
 if [ $# -eq 0 ]; then
     temp=$(current_temp)
-    pct=$(( (6500 - temp) / 40 ))
+    pct=$(( (NEUTRAL - temp) / PER_PERCENT ))
     echo "current intensity: ${pct}% ($(current_mode), ${temp}K)"
     exit 0
 fi
@@ -84,15 +116,18 @@ if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -gt 100 ]; then
     exit 1
 fi
 
-temp=$((6500 - pct * 40))
-sed -i "s/^temp-day=.*/temp-day=$temp/; s/^temp-night=.*/temp-night=$temp/" "$CONF"
-# -P resets the existing gamma ramp first; without it redshift stacks each
-# adjustment on top of the last and the screen creeps redder on every call.
-redshift -P -O "$temp" >/dev/null
+temp=$((NEUTRAL - pct * PER_PERCENT))
+
+# The value is recorded only once the screen has actually taken it. Writing
+# first would leave the state claiming a temperature that never landed —
+# which, with no gamma backend installed, is the difference between a clear
+# error and a tray that lies about what you are looking at.
+"$GAMMA_APPLY" "$temp"
+mkdir -p "$STATE"
+printf '%s\n' "$temp" > "$KELVIN_FILE"
 
 # Only worth arming an override when there is a schedule to hold off.
 if [ "$auto" -eq 0 ] && [ "$(current_mode)" = auto ]; then
-    mkdir -p "$STATE"
     next_boundary > "$OVERRIDE"
     echo "night light set to ${pct}% (${temp}K), holding until $(date -d "@$(cat "$OVERRIDE")" '+%H:%M')"
 else
