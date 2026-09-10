@@ -12,7 +12,6 @@ so the caller can tell "user asked to leave" from "helper died".
 """
 
 import argparse
-import os
 import sys
 
 import gi
@@ -26,15 +25,7 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 # Matched by zen's --skip-class so the fullscreen watcher leaves this window
 # alone; without it the way out of zen gets stretched over the app it sits on.
-#
-# On Wayland the name that travels is the xdg-shell app_id, and GTK3 takes that
-# from g_get_prgname() — not from the X11 program class, which nothing reads
-# here. So the prgname is the authoritative one now and WM_CLASS is set beside
-# it only for an X session. They are deliberately the same string, because
-# zen passes one value to --skip-class and it has to match whichever the
-# compositor reports.
-APP_ID = "zen-exit-button"
-WM_CLASS = APP_ID
+WM_CLASS = "ZenExitButton"
 
 CSS = """
 window { background-color: transparent; }
@@ -74,21 +65,12 @@ button:active { background-color: #942020; }
 """
 
 
-def on_wayland():
-    return bool(os.environ.get("WAYLAND_DISPLAY"))
-
-
 def corner(width, height, margin):
     """Bottom-right of the primary monitor.
 
-    Geometry, not workarea: zen has already hidden the bar, so the space it
-    reserved is gone by the time this runs, and on the run where it is not gone
-    yet the workarea would park the button 27px too high.
-
-    Only used on X11. A Wayland client cannot place its own toplevel — there is
-    no protocol for it, by design — so the position comes from a niri window
-    rule instead (zen writes one; see zen's ensure_window_rules). This is left
-    in place because it still does the right thing in an X session.
+    Geometry, not workarea: zen has already quit the panel, so the strut that
+    reserves space for it is gone by the time this runs, and on the run where
+    it is not gone yet the workarea would park the button 27px too high.
     """
     display = Gdk.Display.get_default()
     monitor = display.get_primary_monitor() or display.get_monitor(0)
@@ -107,15 +89,12 @@ def build(label="Exit Zen", width=88, height=28, margin=10):
     and "the button actually reports that it was pressed" is the one thing in
     zen that has no second way in besides the <Super>Z hotkey.
     """
-    # Before Gtk.init: GTK reads the prgname when it creates the first surface,
-    # and setting it afterwards leaves the window with an app_id of "python3".
-    GLib.set_prgname(APP_ID)
+    GLib.set_prgname("zen-button")
     try:
         Gtk.init([])
     except TypeError:
         Gtk.init()
-    # res_class in WM_CLASS. Meaningless under Wayland and harmless there; it
-    # is what an X session would match on.
+    # res_class in WM_CLASS, which is what Wnck reports as the class group name.
     Gdk.set_program_class(WM_CLASS)
 
     win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
@@ -162,9 +141,7 @@ def build(label="Exit Zen", width=88, height=28, margin=10):
     button.connect("clicked", leave)
     win.connect("destroy", Gtk.main_quit)
     # Moving before show avoids the frame appearing centred and then jumping.
-    # No-op under Wayland, where GTK drops the request rather than failing.
-    if not on_wayland():
-        win.move(*corner(width, height, margin))
+    win.move(*corner(width, height, margin))
     return win, button, status
 
 
@@ -178,8 +155,7 @@ def main():
 
     win, _button, status = build(args.label, args.width, args.height, args.margin)
     win.show_all()
-    if not on_wayland():
-        win.move(*corner(args.width, args.height, args.margin))
+    win.move(*corner(args.width, args.height, args.margin))
 
     Gtk.main()
     return status["code"]

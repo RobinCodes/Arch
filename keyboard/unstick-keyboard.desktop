@@ -2,11 +2,11 @@
 Type=Application
 Version=1.1
 Name=Unstick Keyboard
-GenericName=Session Input Recovery
-Comment=Resume frozen processes and restart a wedged shell, without rebooting
+GenericName=Input Grab Recovery
+Comment=Release the screensaver's stuck keyboard grab without rebooting
 Exec=/usr/local/bin/unstick-keyboard --quiet
 Icon=input-keyboard
 Terminal=false
 Categories=System;
-Keywords=keyboard;stuck;frozen;lock;unlock;wedged;shell;
+Keywords=keyboard;grab;stuck;frozen;screensaver;unlock;
 StartupNotify=false

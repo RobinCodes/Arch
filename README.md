@@ -1,127 +1,32 @@
 # Arch desktop integration
 
-Scripts that embed themselves into the Arch desktop — night light, brightness
-and battery tray icons, display modes and scaling, power profiles, an OOM
-watchdog, and a focus mode. Unlike the other folders here, these aren't
-standalone programs you run once: they're wired into systemd, XDG autostart,
-the compositor config, and keyboard shortcuts, so **the paths below are
-referenced from outside this folder**.
+Scripts that embed themselves into the Arch/XFCE desktop — night light,
+brightness and battery tray icons, the login screen's display layout, and
+touchpad fixes. Unlike the other folders
+here, these aren't standalone programs you run once: they're wired into systemd,
+XFCE autostart, and a keyboard shortcut, so **the paths below are referenced from
+outside this folder**.
 
 Scripts resolve their siblings relative to their own location, so moving this
 folder only requires updating the external references in the last table.
 
 ---
 
-## Ported from XFCE/X11 to niri/Wayland
-
-This folder was written against XFCE on X11 and now runs under **niri** with
-**noctalia** as the shell. Everything works; several things work better. The
-sections below describe the current behaviour, and each one says what it used
-to do where the reason is worth keeping.
-
-The port was not a search-and-replace. Five assumptions were load-bearing
-across the whole folder, and each one had to be answered differently:
-
-| Assumption | Why it broke | What replaced it |
-|---|---|---|
-| A gamma ramp is server state that survives the process that set it | Wayland ties the ramp to the client connection and restores it the moment that client exits, so `redshift -P -O` is a no-op with a flicker in it | `nightlight/gamma-apply`, which keeps a holder alive and swaps holders new-first so the screen never flashes |
-| The tray is XEmbed, so a `Gtk.StatusIcon` appears in the panel | There is no reparenting on Wayland; a StatusIcon draws **nothing** and does not error | `lib/tray.py` publishes StatusNotifierItems over D-Bus, which noctalia's bar hosts |
-| A client can place its own window and grab the seat | Both are compositor-owned by design; `move()` is dropped and there is no grab to take | niri window rules, written to their own `.kdl` files and pulled in with `include` |
-| `xrandr`/EWMH can enumerate outputs and windows | No root window, no `_NET_CLIENT_LIST`, no RandR | `niri msg`, via `lib/niri.sh` and `niri msg --json` |
-| The desktop's settings live in xfconf | There is no xfconf | noctalia's IPC (`noctalia msg`) where one exists, its `settings.toml` where one does not |
-
-Two changes are improvements rather than substitutions, and worth calling out:
-
-- **`zen` hides the shell instead of killing it.** The XFCE version had to run
-  `xfce4-panel --quit` and restart it afterwards, which took every tray plugin
-  down with it and brought them back in a different order. noctalia has
-  `bar-hide`/`bar-show`, so nothing is quit and nothing has to come back.
-- **`resolution` sets one number instead of five.** Panel height, tray icon
-  size, dock size, cursor size and Xft DPI were five independent pixel counts
-  that all had to be moved together. Wayland has one knob — the output's
-  `scale` — and every client that respects it gets all five right at once. The
-  density-capped-by-pixel-budget reasoning that computes it is unchanged.
-
-**What did not come across:** the two LightDM greeter hooks. This machine uses
-greetd with noctalia's own greeter, which reads nothing in `/etc/lightdm`, so
-both installers now refuse and say so rather than writing config nothing reads.
-The replacement is `noctalia msg greeter-sync`, which `monitor/resolution`
-calls on every mode or scale change — same "one source of truth" argument the
-old `monitor-greeter` header makes at length, in one line instead of 309.
-
-### Files niri now owns
-
-`resolution`, `zen` and `brightness-tray` each write a small `.kdl` file next
-to `config.kdl` and add one `include` line to it. That line is the only edit
-ever made to `config.kdl`, which stays hand-maintained; the included files are
-machine-owned and rewritten wholesale.
-
-| File | Written by | Holds |
-|---|---|---|
-| `~/.config/niri/outputs.kdl` | `monitor/resolution` | the chosen mode and scale per output |
-| `~/.config/niri/zen.kdl` | `zen/zen` | the exit button's floating placement |
-| `~/.config/niri/brightness-panel.kdl` | `brightness/brightness-tray.py` | the slider panel's floating placement |
-
-The touchpad is configured directly in `config.kdl`'s `input { touchpad { ... } }`
-block, which replaces `/etc/X11/xorg.conf.d/72-touchpad-robin.conf` entirely —
-including `dwt` (disable-while-typing) and `disabled-on-external-mouse`, the
-latter replacing the `touchpad-auto.sh` poller with a compositor feature.
-
-### One dependency to install
-
-Nothing in this folder ships a Wayland gamma tool, and Arch does not install one
-by default. Until one is present, `nightlight` reports the problem and refuses
-rather than pretending:
-
-```sh
-sudo pacman -S gammastep          # or wlsunset
-yay -S wl-gammarelay-rs           # best: retunes over D-Bus, no respawn
-```
-
-`gamma-apply` auto-detects whichever is installed, preferring the one that does
-not need a restart per change. See its header for the ordering and why.
-
----
-
 ## `nightlight/`
 
-Night light (colour temperature) control. Intensity runs 0–100%, mapping
-linearly to 6500K (neutral) → 2500K (very warm). All state lives in
-`~/.local/state/nightlight/`, including `kelvin`, which holds the current
-temperature. (It used to live in `~/.config/redshift/redshift.conf`; that file
-is still read once as a fallback so an existing install carries its value
-across instead of snapping to neutral.)
-
-**The gamma layer is the one part of this folder that had to be redesigned
-rather than translated.** On X11 a gamma ramp is server state, so
-`redshift -P -O 4000` could set it and exit and the screen stayed warm — the
-old `nightlight` did exactly that, once per call, with no daemon anywhere.
-Wayland ties the ramp to the client that set it through `wlr-gamma-control` and
-restores the original the moment that client disconnects, so a one-shot set is a
-no-op with a flicker in it. `gamma-apply` is the piece that had to be invented:
-something stays alive holding the control for as long as the screen is meant to
-be warm, and `nightlight` just asks it for a number. The schedule, the override
-and the two modes are unchanged.
-
-> **This needs a package.** Nothing here ships a gamma tool and Arch installs
-> none by default, so until one is present `nightlight` reports the problem and
-> refuses rather than lying about what is on screen:
-> `sudo pacman -S gammastep`, or `yay -S wl-gammarelay-rs` for the one that
-> retunes over D-Bus without respawning anything.
->
-> Symptom before the port was noticed: `nightlight-auto` ran every five minutes
-> and logged ``RANDR Query Version' returned error -1 / Initialization of randr
-> failed`` each time, having silently done nothing since the move to Wayland.
+Night light (colour temperature) control, layered on `redshift`. Intensity runs
+0–100%, mapping linearly to 6500K (neutral) → 2500K (very warm). All state lives
+in `~/.local/state/nightlight/`; `~/.config/redshift/redshift.conf` holds the
+current temperature.
 
 | Script | Role |
 |---|---|
 | `nightlight` | The CLI and the single owner of state. `nightlight` prints the current value, `nightlight 60` sets it, `nightlight --mode [auto\|manual]` switches scheduling on or off. |
 | `nightlight-auto` | Drives intensity from the clock: held at 100% from 19:00–07:00, easing to a 35% minimum at 13:00. Run every 5 minutes by a systemd timer. `nightlight-auto --print` writes the intensity that should be on screen to stdout and changes nothing. |
-| `nightlight-gui` | A `yad` slider popup for live adjustment. Bound to `Mod+N`. Runs under XWayland, which is fine — it only shells out to `nightlight`. |
-| `gamma-apply` | Owns "the screen is at K right now". Picks a backend — `wl-gammarelay-rs`, `gammastep`, `wlsunset`, or `redshift` on X11 — and keeps it alive. Swaps holders new-first, so a schedule tick never flashes the screen back to cold. |
-| `nightlight-login` | Applies the schedule as the session comes up, from XDG autostart. Twice, three seconds apart — the culprit changed from xfsettingsd's display pass to noctalia, which implements `wlr-gamma-control` itself and can take the ramp while starting up. |
-| `nightlight-greeter` | **Inert.** Was the same for the LightDM login screen. greetd is the display manager now. |
-| `install-nightlight-greeter.sh` | Refuses and explains, unless `FORCE_LIGHTDM=1`. |
+| `nightlight-gui` | A `yad` slider popup for live adjustment. Bound to `Super+N`. |
+| `nightlight-login` | Applies the schedule as the XFCE session comes up, from XDG autostart. Twice, three seconds apart: xfsettingsd's startup display pass reconfigures the CRTC and wipes the gamma ramp. |
+| `nightlight-greeter` | The same for the LightDM login screen, before anyone has logged in. Root-owned copy in `/usr/local/libexec`, run by LightDM. |
+| `install-nightlight-greeter.sh` | One-shot `sudo` install of that copy and the LightDM drop-in that calls it. |
 
 **Auto vs. manual.** In auto mode, setting a value by hand parks an override
 until the next 07:00/19:00 boundary, then the schedule takes back over. In
@@ -132,14 +37,8 @@ in the greeter sets them, so the login screen used to be a white rectangle at
 2am and the first colour change of the day landed a second or so into the
 session. `install-nightlight-greeter.sh` fixes that:
 
-> **Historical, from the LightDM era.** greetd runs noctalia's own greeter now,
-> which reads nothing under `/etc/lightdm`, so none of what follows in this
-> subsection is live. It is kept because the reasoning is the reasoning, and
-> because switching back to LightDM would make it true again. The current
-> answer is `noctalia msg greeter-sync`, called by `monitor/resolution`.
-
 ```bash
-sudo bash nightlight/install-nightlight-greeter.sh   # refuses unless FORCE_LIGHTDM=1
+sudo bash nightlight/install-nightlight-greeter.sh
 ```
 
 That copies `nightlight-greeter` to `/usr/local/libexec` and points LightDM's
@@ -189,40 +88,17 @@ Which size the screen runs at, and a login screen that agrees with it.
 
 | Script | What it does |
 |---|---|
-| `resolution` | The CLI and the single owner of resolution changes. `resolution` prints the current mode, `resolution highest\|fullhd\|lowest` sets one, `resolution retier` re-fits the UI scale without touching the mode, `resolution --list` prints all three plus the active one in a parseable form. |
+| `resolution` | The CLI and the single owner of resolution changes. `resolution` prints the current mode, `resolution highest\|fullhd\|lowest` sets one, `resolution --list` prints all three plus the active one in a parseable form. |
 | `resolution-tray.py` | The tray icon those are picked from. |
-| `niri-output.py` | The persistence half: writes `~/.config/niri/outputs.kdl` and adds the one `include` line to `config.kdl`. |
-| `monitor-greeter` | **Inert.** Was the LightDM greeter's display layout. |
-| `install-monitor-greeter.sh` | Refuses and explains, unless `FORCE_LIGHTDM=1`. |
-
-**The greeter problem solved itself.** `monitor-greeter` was 309 lines that ran
-as root out of a LightDM display-setup hook, dropped privileges to read the
-user's `displays.xml`, re-validated every field against a regex, and rebuilt the
-layout with `xrandr` before the greeter drew — all to work around a greeter that
-started X with no configuration and put the login box on whichever monitor
-happened to be first. noctalia's greeter is told directly:
+| `monitor-greeter` | Applies the session's saved XFCE display layout to the greeter's X server, before the greeter draws. Root-owned copy in `/usr/local/libexec`, run by LightDM. |
+| `install-monitor-greeter.sh` | One-shot `sudo` install of that copy, the LightDM drop-in that calls it, and the greeter-side fallback. |
 
 ```bash
-noctalia msg greeter-sync
+sudo bash monitor/install-monitor-greeter.sh
 ```
 
-`resolution` calls that on every mode or scale change, so the login screen
-follows the session for the same "one source of truth" reason the old script's
-header argues for at length, in one line instead of several hundred.
-
-**Applying is now two writes, in the opposite order from before.**
-`niri msg output ... mode ...` is explicitly temporary — niri forgets it the
-next time the config is read — so the mode is also written to `outputs.kdl`.
-Under XFCE the profile had to be written *first*, to beat `xfsettingsd`
-re-applying its saved copy on the RandR event. niri has no daemon racing us, and
-writing the config first would make niri reload and re-apply mid-change, so the
-compositor is told first and the file second.
-
-> **Historical, from the LightDM era.** greetd runs noctalia's own greeter now,
-> which reads nothing under `/etc/lightdm`, so none of what follows in this
-> subsection is live. It is kept because the reasoning is the reasoning, and
-> because switching back to LightDM would make it true again. The current
-> answer is `noctalia msg greeter-sync`, called by `monitor/resolution`.
+Nothing changes in the running session — LightDM reads the drop-in when it next
+starts an X server, so this lands on the next reboot.
 
 ### The symptom
 
@@ -361,14 +237,12 @@ MONITOR_GREETER_DRYRUN=1 /usr/local/libexec/monitor-greeter robin
 That prints the `xrandr` command instead of running it, and is the way to check
 what the login screen will do while you're still looking at a working desktop.
 
-Requires `niri` (for `niri msg`) and `python3`.
+Requires `xorg-xrandr`.
 
 ### The resolution tray
 
-`resolution-tray.py` puts a display icon in the bar. Its menu offers three
-presets for whichever output the focused window is on — niri has no `primary`
-flag, being a scrolling WM with no "main" screen, and the focused output is the
-closest honest equivalent:
+`resolution-tray.py` puts a display icon in the top panel's systray. Clicking it
+offers three presets for whichever output is currently primary:
 
 | Preset | On the LG | How it's chosen |
 |---|---|---|
@@ -376,9 +250,8 @@ closest honest equivalent:
 | Full HD | 1920x1080 @ 60 Hz | nearest mode to 1920x1080 |
 | Lowest | 640x480 @ 60 Hz | fewest pixels, then fastest rate |
 
-Nothing is hard-coded to this monitor. The presets are resolved from
-`niri msg outputs` for the focused output on each read, so they still mean
-something on a
+Nothing is hard-coded to this monitor. The presets are resolved from `xrandr`'s
+mode list for the primary output on each read, so they still mean something on a
 different screen, and Full HD degrades to the closest available mode rather than
 failing on a monitor with no exact 1920x1080. The LG's own ceiling is 3840x2160
 @ 60: its EDID caps the pixel clock at 600 MHz, hsync at 135 kHz and vsync at
@@ -386,40 +259,32 @@ failing on a monitor with no exact 1920x1080. The LG's own ceiling is 3840x2160
 resolution *and* no faster refresh at any lower one.
 
 **Three things move together on every switch**, which is why this is a script
-and not three `niri msg` aliases:
+and not three `xrandr` aliases:
 
-1. **The niri output config, written second.** `niri msg output ... mode ...` is
-   temporary and forgotten on the next config read, so the mode also goes to
-   `outputs.kdl`. The *order* is the opposite of the XFCE version, and for a
-   symmetrical reason: there, `xfsettingsd` re-applied its saved layout on RandR
-   events, so `displays.xml` had to be written first or the change had a timer
-   on it. Here nothing races us, and writing the file first would make niri
-   reload and re-apply mid-change.
-2. **The scale, recomputed.** Under XFCE this was five independent pixel counts
-   — panel height, tray icon size, dock size, cursor size and Xft DPI — none of
-   which followed resolution on their own, so all five had to be moved together
-   or 640x480 left a panel eating a sixth of the screen and 4K left everything
-   half-size. Wayland has one knob, the output's `scale`, and every client that
-   respects it gets all five right at once. There is no Xft DPI here and nothing
-   sets one: a scale of 1.5 *is* how you say "144 dpi" to a Wayland client.
-3. **The greeter, told.** `noctalia msg greeter-sync` pushes the layout to the
-   login screen, replacing the 309-line `monitor-greeter`.
+1. **The XFCE profile, written first.** xfsettingsd re-applies its saved layout
+   on RandR events, so an `xrandr` call it doesn't know about is a change with a
+   timer on it. Writing `displays.xml` before calling xrandr means the daemon's
+   copy already agrees before it can react, and the mode survives a logout
+   instead of lasting until the next hotplug. `monitor-greeter` reads that same
+   file, so the login screen follows on the next boot.
+2. **The `--scale` transform, always reset to 1.** This display spent a while
+   running a 2328x1310 desktop bilinear-upscaled to 4K; switching modes without
+   clearing the transform composes the two and lands somewhere neither asked
+   for.
+3. **A UI tier.** Panel heights, icon sizes and the cursor are pixel counts and
+   don't follow resolution — left alone, 640x480 leaves a panel eating a sixth
+   of the screen and 4K leaves everything half-size. Font DPI moves with them
+   and is the one doing the visible work: it holds text at roughly the same
+   *physical* size on the glass across all three presets rather than the same
+   pixel size.
 
-The scale is quantised to `SCALE_STEP` (0.25 by default). niri accepts arbitrary
-fractional scales, but the quarter steps are the ones clients and icon themes
-are actually tested against, and 1.5 looks better than 1.49 for reasons that
-have nothing to do with arithmetic.
+| Band | DPI | Bar | Bar icons | Dock | Cursor |
+|---|---|---|---|---|---|
+| height >= 1800 | 144 | 43 | 26 | 79 | 26 |
+| height >= 1080 | 96 | 26 | 16 | 48 | 16 |
+| below | 72 | 20 | 12 | 36 | 12 |
 
-| Screen | Density asks for | Pixel budget allows | Scale |
-|---|---|---|---|
-| 27" 4K (3840 px / 600 mm) | 143 dpi | 270 dpi | **1.5** |
-| 11.6" laptop (1366 px / 260 mm) | 117 dpi | 96 dpi *(binds)* | **1.0** |
-
-`TIERS_ENABLED=0 resolution fullhd` changes the mode and nothing else.
-
-**XWayland clients are scaled by the compositor rather than re-rendered**, so
-they land at the right physical size and a slightly soft one. That is niri's
-behaviour, not something this can fix.
+`TIERS_ENABLED=0 resolution fullhd` changes resolution and nothing else.
 
 **4K is not free on this machine.** Moving from the old upscaled desktop to a
 native 3840x2160 framebuffer took `shared` memory from ~247 MB to ~617 MB and
@@ -427,41 +292,19 @@ native 3840x2160 framebuffer took `shared` memory from ~247 MB to ~617 MB and
 memory rule in `oom/` below, because it comes straight off that cushion. Full HD
 hands most of it back, which is a real use for the middle preset beyond taste.
 
-Requires PyGObject (`python-gobject`) and `libappindicator`; `niri msg` and
-`noctalia msg` come with the session.
+Requires PyGObject (`python-gobject`); `xrandr` and `xfconf-query` are already
+part of the desktop.
 
 ---
 
 ## `brightness/`
 
-`brightness-tray.py` — backlight and night light warmth from the bar. The menu
-carries a few brightness steps, a few warmth steps and the Auto switch;
-*Adjust...* opens a slider panel with both. Warmth and the Auto switch delegate
-to `../nightlight/nightlight`.
+`brightness-tray.py` — a GTK tray icon for the XFCE panel, mirroring the
+pulseaudio plugin's UX: click for a slider popup, scroll over the icon to step
+backlight brightness. The popup also carries a night light slider and an Auto
+switch, both of which delegate to `../nightlight/nightlight`.
 
-**This tray had the most XFCE-shaped interface of the four and is the one
-StatusNotifierItem could not reproduce as-is.** Three things had to move:
-
-- **A left click can no longer open a popup.** SNI gives the bar one gesture and
-  it opens the menu; there is no activate event to hook. So the common cases are
-  menu items now.
-- **Sliders cannot go in a menu.** DBusMenu carries labels, checkboxes, radio
-  items and separators — a `Gtk.Scale` packed into a menu item arrives as an
-  empty row. That is the whole reason for the steps-in-menu plus panel split.
-- **The panel is a real window.** The X11 build used an override-redirect
-  `Gtk.WindowType.POPUP`, positioned by hand against the tray icon and dismissed
-  by a seat grab that caught the click landing outside it. A Wayland client can
-  do none of those three: it cannot read its icon's position, place its own
-  toplevel, or grab the seat. It is an ordinary window that niri floats by rule,
-  and it closes on Escape, its Close button, or focus-out — which the compositor
-  now actually reports, because this is a window it manages.
-
-Scrolling over the icon still steps brightness where the bar forwards a scroll
-(SNI has a `Scroll` method and libappindicator forwards it, but a bar is not
-obliged to send one). Every step is also in the menu, so nothing is reachable
-only by scrolling.
-
-Requires `brightnessctl`, PyGObject (`python-gobject`) and `libappindicator`.
+Requires `brightnessctl` and PyGObject (`python-gobject`).
 
 ## `battery/`
 
@@ -606,241 +449,230 @@ sysfs doesn't survive a reboot but `~/.local/state/battery/` does — `profile`,
 then settles it against the AC line. Delete all three and the machine reads as
 untouched, at default with the follow on.
 
-**On icon size.** The layout constraint is unchanged — the icon is square, so
-the bolt can't sit beside the digits and while charging the digits give up the
-top 40% of the box to it. What changed is how the size is decided. XEmbed let
-the panel hand the tray its exact pixel size through `size-changed`, and the
-icon was redrawn at that resolution. A StatusNotifierItem has no such
-conversation: the bar takes the picture and scales it. So the icon is now drawn
-once at 32px — big enough to survive being scaled down to whatever the bar uses,
-where a 16px bitmap would visibly blur on a taller bar or at scale 2.
-
-**On publishing a drawn icon at all.** SNI can carry pixel data inline, but
-libappindicator only exposes the by-name path, so `lib/tray.py` writes the
-pixbuf to a PNG in a private directory registered as an icon theme path. The
-filename carries a serial that changes on every write — icon lookups are cached
-aggressively by every toolkit involved, and writing new bytes to the same name
-reliably leaves the bar showing the old picture, which for this tray would mean
-a percentage that never changes. Two files are kept and the rest deleted, or a
-write per poll would be thousands of files an hour.
+**On icon size.** The panel hands the tray a *square* (22px at the current panel
+size) and `xfce4-panel`'s systray squashes anything wider, so the bolt can't sit
+beside the digits — while charging, the digits give up the top 40% of the icon
+to it and render smaller. Clearing the systray's **square icons** option lets a
+wide icon through, which would fit both at full height, but it changes how every
+other tray icon is laid out too, so it's left alone.
 
 ## `nolock/`
 
-Skip the password prompt when the laptop wakes — a tray toggle and `Mod+Alt+U`,
+Skip the password prompt when the laptop wakes — a tray toggle and `Super+U`,
 for when you're somewhere you'd rather just open the lid.
 
 | File | Role |
 |---|---|
-| `nolock` | The CLI and the single owner of the setting. `nolock` prints `on` or `off` plus what each switch currently reads; `nolock on\|off\|toggle` changes it. |
-| `nolock-tray.py` | The tray icon: **open padlock** = nolock on (wake straight into the session), **closed padlock** = a password on wake. The menu carries the toggle, *Lock Now*, and noctalia's settings. |
-| `noctalia-setting.py` | Reads and writes one boolean in noctalia's `settings.toml`, which is how the three switches below are reached — noctalia has no IPC command for them. |
+| `nolock` | The CLI and the single owner of the setting. `nolock` prints `on` or `off`, `nolock on\|off\|toggle` changes it. Bound to `Super+U` as `nolock toggle`. |
+| `nolock-tray.py` | The panel icon: **open padlock** = nolock on (wake straight into the session), **closed padlock** = the XFCE default. Left-click toggles; right-click has the same toggle as a checkbox plus the two settings dialogs it fronts. |
 
-**The lock triggers changed owner, and there are three of them now, not five.**
-niri does not lock; noctalia does, and logind decides what the lid means.
+**Why five settings and not one.** XFCE has five separate switches that can
+each put a lock screen in front of the session, and every one of them defaults
+to locking, so flipping any one alone still leaves you typing a password:
 
-| Setting | Default | Locks? |
+| Channel | Property | Locks when |
 |---|---|---|
-| `lockscreen.lock_before_suspend` | `true` | **Yes — this is the one that catches you.** noctalia holds a logind sleep *delay* inhibitor (visible as "Lock before sleep" in `systemd-inhibit --list`) and raises the lock screen on the way down. Direct heir to xfce4-screensaver's `/lock/sleep-activation`. |
-| `idle.behavior.lock.enabled` | `false` | Lock after an idle timeout. Ships off, so it costs nothing today — managed so that turning it on later cannot silently defeat nolock. |
-| `idle.behavior.lock-and-suspend.enabled` | `false` | Same, with a suspend attached. |
+| `xfce4-power-manager` | `lock-screen-suspend-hibernate` | just before it starts a suspend |
+| `xfce4-screensaver` | `/lock/sleep-activation` | logind announces sleep |
+| `xfce4-screensaver` | `/lock/saver-activation/enabled` | the idle screensaver kicks in — the one that actually catches you on an idle suspend, since the saver activates on the way down |
+| `xfce4-power-manager` | `lid-action-on-ac` | the lid closes on mains, if the action is `3` |
+| `xfce4-power-manager` | `lid-action-on-battery` | the lid closes on battery, if the action is `3` |
 
-`lockscreen.enabled` is deliberately left alone. It is the master switch, and
-with it on `Super+Alt+L` still locks on demand while nolock is on — exactly the
-reasoning that kept `/lock/enabled` untouched under XFCE.
+`/lock/enabled`, the master lock switch, is deliberately left alone, so
+`Ctrl+Alt+L` still locks on demand even while nolock is on.
 
-**The lid pair has no equivalent and is reported rather than changed.**
-`xfce4-power-manager` held a logind `handle-lid-switch` inhibitor and decided
-for itself what a lid close meant, which is why it could be told "blank the
-screen" instead of "lock" — and why it took so long to find, since closing the
-lid never slept the machine and none of the sleep switches ever got a say.
-Nothing in this session takes that inhibitor, so the lid belongs to logind
-again and `HandleLidSwitch` lives in `/etc/systemd/logind.conf`: root-owned
-system configuration, not a per-user toggle. With `lock_before_suspend` off, a
-lid close still suspends and still comes back without asking, which is the
-outcome that was wanted. `nolock status` prints the current lid action so the
-whole picture is in one place.
+### The lid pair, and why the first three weren't enough
 
-**Why the table grew a column.** The XFCE version got away with one value doing
-double duty: for all five of its keys, the value meaning "this would lock" was
-*also* the compiled-in default, so an unset key read as locking and restored to
-the value it would have had anyway. That coincidence does not hold here.
-`lock_before_suspend` defaults to `true` (locking) and both idle behaviours
-default to `false` (not locking), so "what does unset mean" and "what do I
-write to make it lock again" became different questions.
+For a while this locked on every lid close while reporting itself on, which
+looked like the settings not sticking and wasn't. The first three keys are all
+about locking *around a sleep*, and **closing the lid on this machine never
+sleeps**: `journalctl -kb | grep 'PM: suspend'` came back empty across three
+days of uptime and a dozen lid closes.
 
-Getting that wrong is not theoretical: the first version of the port restored
-an unset key by writing the locking value, and `nolock off` duly switched **on**
-two idle-lock behaviours that had never been on. Restoring now means removing
-the key, which is what `noctalia-setting.py del` is for.
+`xfce4-power-manager` holds a logind `handle-lid-switch` **block** inhibitor —
+visible in `systemd-inhibit --list` — so it, not logind, decides what a lid
+close means. Its two lid keys were unset, and unset is not "do the sensible
+thing": the compiled-in default is `3`, and 3 is *lock screen*. So the lid was
+locking directly, with no suspend, no `PrepareForSleep` and no screensaver
+activation anywhere in the sequence for the other three keys to veto. They were
+all working exactly as documented, on an event that wasn't happening.
+
+The action is a seven-member enum, and it's worth writing down because
+`xfconf-query` will take any integer and XFCE gives no hint which is which:
+
+| | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|---|
+| | DPMS | suspend | hibernate | **lock screen** | nothing | hybrid sleep | shutdown |
+
+Read out of the installed binary's `GEnum` table rather than trusted to
+memory, along with the `g_param_spec_uint` default of 3, since both keys being
+absent is precisely the case where the default is the whole story.
+
+**On sets the pair to 0, DPMS**: the display goes off, the session keeps
+running, and opening the lid comes straight back to it. That is what the lid
+already did, minus the lock. Off restores 3.
+
+**A key that already isn't locking is left alone.** `on` writes only to keys
+that would lock, so a lid action deliberately set to suspend (1) survives it
+rather than being flattened to DPMS — nolock's job there is done by the three
+sleep keys, and it has no business overriding the choice.
+
+**The setting *is* the state.** There's no state file saying "nolock is on" —
+the five xfconf values are read back directly, which is why it survives a
+reboot and can't drift from what XFCE is doing, and why changing any of them in
+the settings dialogs shows up in the tray icon immediately. The one file it
+does keep, `~/.local/state/nolock/saved`, is a snapshot of the values from
+before nolock was switched on, so `off` restores what was there rather than
+assuming the defaults.
+
+**One rule covers both kinds of key**: a key locks when its effective value
+equals its locking value, where "effective" means the compiled-in default while
+it's unset. That reads a boolean defaulting to `true` and a seven-member lid
+enum with the same line, and it's why the locking value doubles as what `off`
+writes back — for all five it's also the default, so restoring lands on the
+value the key would have had anyway.
+
+**The snapshot is taken per key, not per file.** It used to skip the whole
+thing if `saved` already existed, which was right when the table never changed
+and wrong the moment the lid pair was added: with nolock already on, the file
+was there, the two new keys would have been switched to DPMS with nothing
+recording that they'd started at 3, and `off` would have quietly left the lid
+not locking. Keys already in the file are still never re-recorded — that would
+overwrite the originals with the values nolock itself just wrote.
+
+**Restoring writes the value instead of removing the key.** Deleting the
+property would be the tidier way back to a shipped default, but
+`xfce4-power-manager` binds its keys both ways: remove one and the daemon
+writes its in-memory copy — still the nolock value — straight back, silently,
+in the direction that leaves a laptop no longer locking. Every write is read
+back and mismatches are fatal.
+
+Requires PyGObject (`python-gobject`) and the `Xfconf` typelib (`xfconf`).
 
 ## `keyboard/`
 
-Recovery for a session that has stopped taking input, and the logind tuning
-that makes the worst case rarer.
+The keyboard dying session-wide — every key doing nothing while the mouse still
+works, the lid close no longer blanking the screen, and any lock attempt ending
+in xfce4-session's *"Failed to lock the screen"*.
 
 | File | Role |
 |---|---|
-| `unstick-keyboard` | Recovery. Resumes SIGSTOP'd processes and restarts the shell if it has stopped answering its IPC. Installed to `/usr/local/bin/`. |
+| `unstick-keyboard` | Recovery. Releases the stuck grab and restarts the screensaver. Installed to `/usr/local/bin/`. |
 | `unstick-keyboard.desktop` | Launcher for it, because the recovery has to be reachable without a keyboard. Installed to `/usr/share/applications/`. |
-| `10-inhibit-delay.conf` | `InhibitDelayMaxSec=30`. Installed to `/etc/systemd/logind.conf.d/`. |
+| `10-inhibit-delay.conf` | The actual fix. Installed to `/etc/systemd/logind.conf.d/`. |
 | `install-keyboard-fix.sh` | One-shot `sudo` install of all three. |
 
-**The original bug cannot happen here, and that is worth being precise about.**
-On X11, `xfce4-screensaver` held a logind delay inhibitor on sleep so it could
-raise the lock screen first, and locking meant `XGrabKeyboard` on the root
-window. If `InhibitDelayMaxSec` elapsed first, logind suspended anyway and froze
-`user.slice` mid-lock — and what came back was a screensaver stuck partway
-through locking, still holding the keyboard grab, with no lock window on screen
-to type into. Every keystroke went to that grab and vanished.
+> **Installed 2026-08-17**, having sat uninstalled for some time before that —
+> this section described the machine it was written for, not the one it was on.
+> All three files are in place and `systemd-analyze cat-config systemd/logind.conf`
+> shows the drop-in overriding the stock 5s.
+>
+> `InhibitDelayMaxSec=30` **takes effect at the next reboot**: the installer
+> reloads systemd but deliberately doesn't restart logind, which would drop the
+> seat and could take the X session with it. Until then logind still reports
+> `InhibitDelayMaxUSec=5s`. Nothing is worse in the meantime, and the lid can't
+> trigger the wedge anyway now that it's on DPMS rather than a suspend.
 
-There is no `XGrabKeyboard` on Wayland and no root window to grab. Input routing
-belongs to the compositor, and a client that wedges *loses* input rather than
-capturing everyone else's. niri keeps taking keys no matter what any client does.
+### What happens
 
-**Two things survived the port, which is why the folder still exists:**
+`xfce4-screensaver` takes a logind **delay inhibitor** on every sleep so it can
+get the lock screen up before the machine goes down, and locking means
+`XGrabKeyboard` + `XGrabPointer` on the root window. logind waits
+`InhibitDelayMaxSec` — **5 seconds** by default — and then suspends regardless,
+at which point systemd freezes all of `user.slice`, screensaver included,
+partway through the grab.
 
-1. **Suspended processes.** `oom-defender` freezes with SIGSTOP and resumes on
-   its own — but only while it is alive to remember what it froze. Killed or
-   crashed mid-episode, its victims stay stopped forever. A stopped process
-   owning the window you are typing into is indistinguishable from a dead
-   keyboard, and this is now the *most* likely cause rather than the least.
+What resumes is a screensaver still holding the keyboard grab, with no lock
+window on screen to type into. Every keystroke goes to that grab and is
+discarded. The pointer grab is usually not taken, or is dropped, which is why
+the mouse survives and the keyboard doesn't.
 
-2. **A wedged lock screen.** noctalia locks through `ext-session-lock`, which is
-   deliberately fail-closed: if the lock client dies without unlocking, the
-   compositor keeps the session locked and shows a blank screen. That is the
-   right security choice and a terrible place to be stuck, because the thing
-   that could unlock it is the thing that died. `unstick-keyboard` detects a
-   shell that has stopped answering `noctalia msg status` and restarts it, which
-   puts a password prompt back on screen.
+Five seconds is generous on most machines and very tight on this one: 3.4 GB of
+RAM, `vm.swappiness = 150`, and a desktop that has normally been paged out to
+the swapfile by the time the lid closes. The screensaver has to be read back
+from disk before it can answer at all.
 
-**`10-inhibit-delay.conf` is still doing real work**, for the same reason as
-before with a different daemon: noctalia takes a sleep *delay* inhibitor to lock
-before suspend, and on a 3.4 GB machine that has been paged out to swap, the
-shipped 5s budget is tight. 30s is the cost ceiling, not the cost — the
-inhibitor is released as soon as the lock is up, so a suspend that took 0.3s
-still takes 0.3s.
+It is in the journal as:
 
-> **Installed 2026-08-17.** `systemd-analyze cat-config systemd/logind.conf`
-> confirms the drop-in still overrides the stock 5s under the current session.
-> `unstick-keyboard` itself was rewritten for Wayland and needs reinstalling
-> (`sudo bash install-keyboard-fix.sh`) — the copy in `/usr/local/bin` is the
-> X11 one until you do.
+```
+systemd-logind: Delay lock is active (UID 1000/robin, PID 1051/xfce4-screensav)
+                but inhibitor timeout is reached.
+```
+
+Every occurrence of that line so far has been followed by a reboot, because
+there was no other way out.
+
+### The fix, and why there is also a recovery
+
+`InhibitDelayMaxSec=30` is a ceiling rather than a cost — the inhibitor is
+released the moment the lock is up, so a suspend that took 0.3s still takes
+0.3s. It only spends the extra in the case that used to wedge.
+
+That makes the failure rare, not impossible; deep enough in the swapfile, 30s
+can be missed too. So `unstick-keyboard` exists for the times it still happens,
+and it is a **launcher rather than a keybinding on purpose** — a shortcut is
+useless when the thing that's broken is the keyboard. Add it to the panel via
+*right-click the panel > Panel > Add New Items > Launcher*, or find it under
+*Applications > System > Unstick Keyboard*.
+
+X11 drops every grab a client holds as soon as its connection closes, so the
+recovery is really just "kill the screensaver and start a clean one". Around
+that it also `SIGCONT`s anything left suspended: `oom-defender` freezes with
+`SIGSTOP` and only resumes what it remembers freezing, so if it is killed
+mid-episode its victims stay stopped indefinitely, and a stopped process
+holding a grab presents identically. A shell job suspended with `Ctrl+Z` gets
+resumed along with them — the intended trade for a machine that is already
+unusable.
+
+`unstick-keyboard --dry-run` prints what it would do and touches nothing.
+
+### If it happens before this is installed
+
+`xfce4-screensaver` is 17 characters and the kernel keeps 15, so it only ever
+appears as `xfce4-screensav` — `pkill -x xfce4-screensaver` silently matches
+nothing. From a TTY (`Ctrl+Alt+F2` still switches under an X grab) or over ssh:
+
+```sh
+pkill -f xfce4-screensav && DISPLAY=:0 setsid xfce4-screensaver &
+```
 
 ## `touchpad/`
 
-**Superseded by the compositor.** Everything this folder did is now three lines
-in `~/.config/niri/config.kdl`:
-
-```kdl
-input {
-    touchpad {
-        tap
-        dwt                             // disable while typing
-        drag-lock
-        natural-scroll
-        tap-button-map "left-right-middle"
-        click-method "button-areas"     // bottom-right corner = right click
-        disabled-on-external-mouse
-    }
-}
-```
-
-That is full parity with the old `72-touchpad-robin.libinput.conf`, plus the
-two things that used to need help:
-
-| Old mechanism | Why it existed | Replaced by |
-|---|---|---|
-| `apply-touchpad.sh`, run twice at login from XDG autostart | `xfsettingsd` reset scroll direction and tap mapping at every login, so the config had to be re-asserted after it had had its say | Nothing. niri applies its own input config and there is no second daemon racing it. |
-| `touchpad-auto.sh` + `touchpad-auto.service`, a 2s poller | The ELAN0647 emits ghost touches (32 phantom button events in 30s, measured 2026-08-20, with `kernel bug: Touch jump detected and discarded` in the Xorg log). The poller disabled the touchpad whenever a USB mouse was present. It had to be a poller because udev `RUN+=` has no session to reach `xinput` from. | `disabled-on-external-mouse`, a libinput feature niri exposes directly. No polling, no X connection, no service. |
-
-The X11 files (`72-touchpad-robin.conf`, `72-touchpad-robin.libinput.conf`,
-`apply-touchpad.sh`, `switch-to-libinput.sh`, `touchpad-auto.sh`) are kept for
-reference and for an X session; none of them run here.
-`touchpad-auto.service` has been disabled — it was restart-looping every 5
-seconds against an X server that does not exist, 447 restarts deep by the time
-it was found. `grab-watchdog.service`, which is not in this repo but was
-looping for the same reason, was disabled with it.
-
-### Smooth scrolling, and the half that stopped being necessary
-
-The touchpad half is the config above. The other half was `~/.xprofile`
-exporting `MOZ_USE_XINPUT2=1`, because on X11 pixel-precise scroll deltas only
-reached a client that asked for XInput2 events, and Firefox did not ask unless
-that was set — so scrolling felt stepped in the browser and smooth everywhere
-else.
-
-**That variable does nothing under Wayland and is no longer needed.** There is
-no core-protocol fallback to opt out of: `wl_pointer.axis` carries the delta
-natively, and Firefox on Wayland gets kinetic flicks, pinch zoom and swipe
-navigation without being told to. `~/.xprofile` is also no longer sourced —
-it was read by `/etc/lightdm/Xsession`, which nothing runs now.
-
-## `zen/`
-
-Strip the desktop down to one app (or a few) and freeze the screen.
-
 | File | Role |
 |---|---|
-| `zen` | The CLI and the owner of the session state. `zen NAME...` enters, `zen --pick` chooses from a dialog, `zen --exit` leaves, `zen --status`, `zen --dry-run`. |
-| `zen-wm.py` | Window listing and control, via niri's IPC. |
-| `zen-pick.py` | The chooser: type-to-filter over sets and every installed app, with checkboxes for multi-app zen. |
-| `zen-apps.py` | Lists every installed application as `name<TAB>command`, straight from the XDG desktop-entry path. |
-| `zen-button.py` | The leave-zen affordance: one button, and nothing around it. |
+| `apply-touchpad.sh` | Re-asserts scroll direction and tap mapping, which `xfsettingsd` resets at every login. Auto-detects synaptics vs. libinput, so it survives a driver switch. Runs at login, applies twice (once immediately, once after 2s) so its values win the race with `xfsettingsd`. |
+| `switch-to-libinput.sh` | One-shot `sudo` migration from synaptics to libinput. Installs the libinput config and `xorg-xinput` together, so a partial migration is impossible. Requires a logout to take effect. |
+| `72-touchpad-robin.conf` | Xorg config, synaptics variant. |
+| `72-touchpad-robin.libinput.conf` | Xorg config, libinput variant. Installed by `switch-to-libinput.sh` to `/etc/X11/xorg.conf.d/72-touchpad-robin.conf`. |
 
-**Zen stays inside the running compositor session, and the reason got stronger
-after the port.** The night light is a gamma ramp held by a live client, and the
-compositor takes it back the instant that client goes away — so a kiosk session
-on another VT, or restarting niri, would snap the screen to a cold 6500K the
-moment zen started. On X11 the same conclusion came from the ramp being
-per-X-server state; here it is per-*connection*, which is a shorter fuse for the
-same mistake. Zen tears down the visible layer and stops the automation, and
-never touches the display pipeline.
+The device is currently on **libinput**. The header comment in the libinput
+config refers to an "edge-motion systemd service" — no such service is
+installed; treat that line as stale.
 
-**The desktop is asked, not killed — and this is the port's clearest win.**
+### Smooth scrolling, and the half of it that isn't here
 
-| What zen does | XFCE | niri + noctalia |
-|---|---|---|
-| Hide the panel | `xfce4-panel --quit`, then restart it on exit | `noctalia msg bar-hide` / `bar-show` |
-| Hide the desktop | `xfdesktop --quit` | `desktop-widgets-hide` / `-show` |
-| Silence notifications | xfconf `xfce4-notifyd /do-not-disturb` | `notification-dnd-set on\|off` |
-| Stop idle/blank | xfconf presentation-mode + `xfce4-screensaver-command --inhibit` | `caffeine-enable`, plus a `systemd-inhibit` that dies with zen |
-| Hide OSD popups | *(not possible)* | `osd-disable` / `osd-enable` |
+The touchpad half is the config above: libinput, two-finger, pixel deltas. The
+other half is `~/.xprofile`, which is outside this folder and exports one
+variable:
 
-Quitting the panel took every tray plugin down with it — clipman, nm-applet,
-blueman, and this repo's own four — and brought them back in a different order,
-or not at all if one had crashed meanwhile. Hiding is reversible in a way
-quitting never was.
+```sh
+export MOZ_USE_XINPUT2=1
+```
 
-**What was lost: the single workspace.** xfwm4 had a fixed workspace count that
-could be set to 1, so there was literally nowhere to wander off to. niri creates
-and destroys workspaces on demand and has no count to clamp. Faking it would
-mean rewriting the user's keymap on the way in and restoring it on the way out —
-a much bigger promise than zen should make about a config file it does not own.
+On X11 those pixel deltas only reach a client that asked for XInput2 events,
+and Firefox doesn't ask unless that is set — it falls back to the core
+protocol, where the only way to say "scrolled" is a button 4/5 click, one per
+notch. Which is why scrolling felt stepped in the browser and smooth
+everywhere else: GTK takes XI2 unconditionally, so every other app on the
+machine was already getting what the touchpad was sending.
 
-**Windows are handled by id, not by pid.** `zen-wm.py` was built on libwnck,
-which reads EWMH properties off the X root window; there is no root window and
-no `_NET_CLIENT_LIST` here, so niri is now the only authority on what exists.
-Closing still sends a polite close request, so an app with unsaved work gets to
-put up its save prompt — anything still alive at the deadline is reported rather
-than killed.
+It also switches on the rest of what APZ does with a real touchpad — kinetic
+flicks that coast after your fingers lift, two-finger pinch zoom, swipe to
+navigate. Those prefs (`apz.gtk.kinetic_scroll.enabled`,
+`apz.gtk.pangesture.enabled`) were on the whole time with nothing to feed them.
 
-The one thing that got *harder*: niri reports `is_floating`, `is_focused` and
-`is_urgent` for a window but **not** whether it is fullscreen, and
-`fullscreen-window` is a toggle rather than a set. So "put everything back"
-cannot be answered by asking. The ids zen fullscreened are written to
-`~/.local/state/zen/fullscreened` as they happen, and exit toggles exactly those
-back — which also makes it correct across a zen that died and was restarted,
-something the libwnck version got for free by reading live state.
-
-**The exit button is placed by the compositor.** A Wayland client cannot
-position its own toplevel, so the corner the X11 build asked for with `move()`
-is a niri window rule now, written to `~/.config/niri/zen.kdl` on every enter.
-It opens unfocused on purpose: it appears while the app you asked for is still
-mapping, and stealing focus at that moment would put your first keystrokes into
-a button.
-
-Requires PyGObject, `yad`, and noctalia for the hide/show half (zen still runs
-without it, there is just less to hide).
+`~/.xprofile` is sourced by `/etc/lightdm/Xsession` before `xfce4-session`
+starts, so it needs a fresh login, not just a Firefox restart.
 
 ## `codecs/`
 
@@ -932,19 +764,13 @@ tabs behind it, the video is probably the largest thing on the machine, and
 freezing it to save tabs nobody is looking at gets the trade backwards.
 Candidates are ordered by three keys:
 
-1. **Attention.** The focused window's PID comes from the compositor —
-   `niri msg focused-window`, which hands the pid over directly, or the old
-   two-step `xprop -root _NET_ACTIVE_WINDOW` → `_NET_WM_PID` walk under X11.
-   Wayland has no root window and no `_NET_ACTIVE_WINDOW` to read, so there is
-   no protocol-level way to ask this question: every compositor answers on its
-   own IPC or not at all. That is why it is a branch rather than one command.
-
-   The group around it grows *down* through children and *up* through parents,
-   stopping at the first name in `protect`. That bound is the whole trick: a
-   browser's parent is the shell and *its* parent is the session, so an
-   unbounded walk would declare the entire desktop off limits, while stopping at
-   the first protected name keeps a browser's content processes with the browser
-   and nothing more.
+1. **Attention.** The focused window's PID comes from the window manager via
+   `xprop -root _NET_ACTIVE_WINDOW`, then `_NET_WM_PID`. The group around it
+   grows *down* through children and *up* through parents, stopping at the
+   first name in `protect`. That bound is the whole trick: Firefox's parent is
+   `xfce4-panel` and *its* parent is the session, so an unbounded walk would
+   declare the entire desktop off limits, while stopping at the first protected
+   name keeps a browser's content processes with the browser and nothing more.
 2. **In use.** Burning CPU without growing is what a video decoding or a build
    running looks like. Burning CPU *and* growing is the runaway, which stays a
    candidate — otherwise the one process worth catching would be the one
@@ -953,7 +779,7 @@ Candidates are ordered by three keys:
    now, so a process taking 40 MB/s is caught while it is still small enough
    for freezing it to be worth something.
 
-No graphical session, no answer from the compositor, or nothing focused, and
+No X session, no `xprop`, or a focused window that sets no `_NET_WM_PID`, and
 the group is empty — which returns victim choice to size alone, exactly the
 behaviour this had before.
 
@@ -1104,94 +930,62 @@ Everything that points into this folder. Update these if the folder moves:
 |---|---|
 | `~/.config/systemd/user/nightlight-auto.service` | `nightlight/nightlight-auto` |
 | `~/.config/autostart/nightlight-login.desktop` | `nightlight/nightlight-login` |
+| `/etc/lightdm/lightdm.conf.d/50-nightlight.conf` | `nightlight/nightlight-auto`, for the schedule the greeter follows — rewrite it by re-running `install-nightlight-greeter.sh`, not by hand. Its `display-setup-script` is overridden by the `60-` drop-in below, which chains to it |
 | `~/.config/autostart/brightness-tray.desktop` | `brightness/brightness-tray.py` |
 | `~/.config/autostart/battery-tray.desktop` | `battery/battery-tray.py` |
+| `~/.config/autostart/touchpad-tweaks.desktop` | `touchpad/apply-touchpad.sh` |
 | `~/.config/autostart/nolock-tray.desktop` | `nolock/nolock-tray.py` |
 | `~/.config/autostart/resolution-tray.desktop` | `monitor/resolution-tray.py` |
 | `~/.local/share/applications/nightlight-gui.desktop` | `nightlight/nightlight-gui` |
-| `~/.config/niri/config.kdl` → `binds` | `nightlight-gui`, `nolock`, `zen`, `unstick-keyboard` — see the keybinding table below |
+| xfconf `xfce4-keyboard-shortcuts` → `/commands/custom/<Super>n` | `nightlight/nightlight-gui` |
+| xfconf `xfce4-keyboard-shortcuts` → `/commands/custom/<Super>u` | `nolock/nolock` |
 | `~/.bashrc` | puts `nightlight/` on `PATH` |
 
-**XDG autostart works under niri** — `niri --session` activates
-`xdg-desktop-autostart.target` and systemd generates an `app-*@autostart.service`
-per `.desktop` file, so the four trays start with the session exactly as they
-did under XFCE. Two entries needed attention during the port:
-
-- `nightlight-login.desktop` carried `OnlyShowIn=XFCE;`, so the generator
-  created the unit and then skipped it every boot (`Condition check resulted in
-  Night light being skipped`). The line is gone.
-- `touchpad-tweaks.desktop` was deleted outright — see `touchpad/`.
-
-### Keybindings
-
-These used to live in xfconf, which does not exist here; they are now plain
-niri binds in `config.kdl`. `Super+U` could not be kept because niri already
-uses it for `focus-workspace-down`.
-
-| Chord | Runs | Was |
-|---|---|---|
-| `Mod+N` | `nightlight/nightlight-gui` | `Super+N` (unchanged) |
-| `Mod+Alt+U` | `nolock/nolock toggle` | `Super+U` |
-| `Mod+Shift+Z` | `zen/zen --pick` | `Super+Shift+Z` (unchanged) |
-| `Mod+Z` | `zen/zen --exit` | `Super+Z` (unchanged) |
-| `Mod+Ctrl+Shift+U` | `keyboard/unstick-keyboard --quiet` | a panel launcher |
-
-Because they are in the config file rather than in a daemon's memory, editing
-`config.kdl` is now the right way to change them — niri reloads on save, and
-`niri msg action load-config-file` forces it. The old warning about `xfconfd`
-overwriting a hand-edited XML file no longer applies to anything here.
-
-### Machine-owned niri files
-
-Written by the scripts, safe to delete (they are regenerated), and pulled into
-`config.kdl` by a single `include` line each:
-
-| File | Written by |
-|---|---|
-| `~/.config/niri/outputs.kdl` | `monitor/resolution` |
-| `~/.config/niri/zen.kdl` | `zen/zen` |
-| `~/.config/niri/brightness-panel.kdl` | `brightness/brightness-tray.py` |
-
-### Copies, not references
-
-These live outside the folder as *copies*, so moving it doesn't break them —
-re-running the matching `install-*.sh` is what updates them:
+A few more live outside this folder but are *copies* rather than references, so
+moving it doesn't break them — re-running the matching `install-*.sh` is what
+updates them:
 
 | File | Holds |
 |---|---|
+| `/usr/local/libexec/nightlight-greeter` | a copy of `nightlight/nightlight-greeter` |
+| `/usr/local/libexec/monitor-greeter` | a copy of `monitor/monitor-greeter` |
+| `/etc/lightdm/lightdm.conf.d/60-monitor.conf` | written by `monitor/install-monitor-greeter.sh`; names that copy, and chains to whatever held `display-setup-script` before it |
+| `/etc/lightdm/lightdm-gtk-greeter.conf.d/60-monitor.conf` | written by the same script — the `active-monitor` fallback |
+| `/usr/local/libexec/battery-power-profile` | a copy of `battery/power-profile-apply` |
+| `/etc/sudoers.d/battery-power-profile` | the NOPASSWD rule naming that path |
 | `/usr/local/bin/oom-defender` | a copy of `oom/oom-defender` |
 | `/etc/systemd/system/oom-defender.service` | a copy of `oom/oom-defender.service` |
 | `/etc/oom-defender.conf` | a copy of `oom/oom-defender.conf`, then hand-tuned |
 | `/etc/sysctl.d/99-oom-defender.conf` | written by `oom/install-oom-defender.sh` |
 | `/etc/systemd/zram-generator.conf` | written by `oom/install-oom-defender.sh` |
 | `/etc/fstab` | the `/swapfile` line, appended by the same script |
-| `/usr/local/bin/unstick-keyboard` | a copy of `keyboard/unstick-keyboard` |
-| `/etc/systemd/logind.conf.d/10-inhibit-delay.conf` | a copy of `keyboard/10-inhibit-delay.conf` |
-| `/usr/local/libexec/battery-power-profile` | a copy of `battery/power-profile-apply` |
-| `/etc/sudoers.d/battery-power-profile` | the NOPASSWD rule naming that path |
-
-> **Two copies are stale** after the port and need `sudo` to refresh:
-> `/usr/local/bin/oom-defender` (still the X11 focus-detection build) and
-> `/usr/local/bin/unstick-keyboard` (still the screensaver-grab build). Re-run
-> `oom/install-oom-defender.sh` and `keyboard/install-keyboard-fix.sh`.
-
-### Inert leftovers
-
-Harmless, but they are not doing anything and will not:
-
-| File | Why it is dead |
-|---|---|
-| `/usr/local/libexec/nightlight-greeter`, `/etc/lightdm/lightdm.conf.d/50-nightlight.conf` | LightDM is not the display manager; greetd is |
-| `/usr/local/libexec/monitor-greeter`, `/etc/lightdm/lightdm.conf.d/60-monitor.conf`, `/etc/lightdm/lightdm-gtk-greeter.conf.d/60-monitor.conf` | same |
-| `/etc/X11/xorg.conf.d/72-touchpad-robin.conf` | no X server reads it |
-| `~/.xprofile` | sourced by `/etc/lightdm/Xsession`, which nothing runs; `MOZ_USE_XINPUT2` is meaningless on Wayland |
-| `~/.config/redshift/redshift.conf` | read once as a fallback by `nightlight`, then superseded by `~/.local/state/nightlight/kelvin` |
-| `~/.config/systemd/user/grab-watchdog.service`, `touchpad-auto.service` | disabled during the port; both were restart-looping against an absent X server |
 
 `~/.config/mozilla/firefox/vfgut37p.default-release/user.js` is hand-maintained
 rather than installed by anything here, but belongs to the same memory strategy
 — see *Firefox unloads its own tabs first* above. Delete the file to revert
 every pref in it.
+
+`~/.xprofile` is the same kind of thing for the touchpad: hand-maintained, not
+installed by anything here, and the other half of *Smooth scrolling* above.
+`/etc/lightdm/Xsession` sources it at line 44, before `xfce4-session` starts.
+Delete the file to put Firefox back on core-pointer scroll events.
+
+The `Super+N` and `Super+U` bindings live in xfconf, not just on disk. Change
+them with `xfconf-query`, not by editing `xfce4-keyboard-shortcuts.xml` —
+`xfconfd` keeps the value in memory and will overwrite a hand-edited file:
+
+```bash
+xfconf-query -c xfce4-keyboard-shortcuts -p '/commands/custom/<Super>n' -s /new/path
+```
+
+Rebinding means creating the new key and removing the old one, since the
+keystroke *is* the property name:
+
+```bash
+xfconf-query -c xfce4-keyboard-shortcuts -p '/commands/custom/<Super>i' --create --type string \
+    --set "$PWD/nolock/nolock toggle"
+xfconf-query -c xfce4-keyboard-shortcuts -p '/commands/custom/<Super>u' --reset
+```
 
 `nightlight-auto.timer` uses `OnCalendar` wall-clock ticks rather than
 `OnUnitActiveSec`, because monotonic time stops during suspend — a laptop

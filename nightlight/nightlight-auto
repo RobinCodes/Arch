@@ -10,11 +10,10 @@
 # account's config, so it asks for the number and applies it itself. That keeps
 # the curve below the only definition of the schedule.
 NIGHTLIGHT="$(cd "$(dirname "$0")" && pwd)/nightlight"
+CONF="$HOME/.config/redshift/redshift.conf"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nightlight"
 OVERRIDE="$STATE/override-until"
 MODE_FILE="$STATE/mode"
-KELVIN_FILE="$STATE/kelvin"
-LEGACY_CONF="$HOME/.config/redshift/redshift.conf"
 
 PEAK=100  # night-time intensity, as a % of nightlight's 0-100 scale (2500K)
 NOON=35   # daytime minimum, reached at 13:00
@@ -25,11 +24,10 @@ if [ "$1" = "--print" ]; then
     shift
 fi
 
-# The systemd user manager gets WAYLAND_DISPLAY and NIRI_SOCKET from niri's
-# own `systemctl --user import-environment` at session start, so there is
-# nothing to fake here the way the X11 version had to fake DISPLAY. If the
-# variables are genuinely absent the session is not up and gamma-apply will
-# say so rather than half-work.
+# The 30s-after-startup run can beat xfce4-session's import of the session
+# environment into systemd, leaving redshift with no X server to talk to.
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 
 # The intensity already on record, for --print in the cases where the schedule
 # is not the one deciding. Falls back to the argument — the scheduled value —
@@ -37,9 +35,7 @@ fi
 # at midday should not go night-warm just because a file went missing.
 current_pct() {
     local temp
-    temp=$(cat "$KELVIN_FILE" 2>/dev/null)
-    [[ "$temp" =~ ^[0-9]+$ ]] || \
-        temp=$(grep -oP '(?<=^temp-day=)\d+' "$LEGACY_CONF" 2>/dev/null)
+    temp=$(grep -oP '(?<=^temp-day=)\d+' "$CONF" 2>/dev/null)
     if [[ "$temp" =~ ^[0-9]+$ ]]; then
         echo $(( (6500 - temp) / 40 ))
     else
