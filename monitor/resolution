@@ -1,67 +1,65 @@
 #!/usr/bin/env bash
-# resolution — switch the primary monitor between three presets: the best mode
+# resolution — switch the focused monitor between three presets: the best mode
 # it can do, 1920x1080, and the smallest mode it can do.
 #
-# Nothing here is hard-coded to this machine's monitor. The presets are resolved
-# from whatever `xrandr` reports for the output currently flagged primary, so
-# "highest" and "lowest" mean the ends of that monitor's own mode list and the
-# tool still says something sensible on a different screen. Today, on the LG:
+# Nothing here is hard-coded to this machine's monitor. The presets are
+# resolved from whatever niri reports for the focused output, so "highest" and
+# "lowest" mean the ends of that monitor's own mode list and the tool still
+# says something sensible on a different screen.
 #
-#   highest  3840x2160 @ 60 Hz   (its EDID caps it there — 594 MHz pixel clock,
-#                                 135 kHz hsync, 61 Hz vsync, all at the limit)
-#   fullhd   1920x1080 @ 60 Hz
-#   lowest   640x480   @ 60 Hz
-#
-# Every preset is a real mode driven at the panel's native timing, so each also
-# clears any `--scale` transform. That matters here: this display spent a while
-# running a 2328x1310 desktop bilinear-upscaled to 4K, and switching modes
-# without resetting the transform would compose the two and land somewhere
-# neither asked for.
+# Usage: resolution [status|highest|fullhd|lowest|retier|--list] [--quiet]
 #
 #
-# WHY IT WRITES THE XFCE PROFILE TOO
+# WHAT THE WAYLAND PORT CHANGED, AND WHAT IT DID NOT
 #
-# xfsettingsd owns the display layout in an XFCE session and re-applies its
-# saved profile on RandR events, so an xrandr call it doesn't know about is a
-# change with a timer on it. Writing displays.xml first and calling xrandr
-# second means the daemon's copy already agrees before it can react, and the
-# setting survives a logout instead of lasting until the next hotplug.
+# The argument this script is built on is unchanged, and it is the part worth
+# keeping: the right UI size comes from the monitor's physical density capped
+# by its pixel budget, not from its pixel count. That reasoning is reproduced
+# in full below because it is the whole point of the file.
 #
-# It has a second reader: monitor-greeter applies that same profile to the login
-# screen, so the greeter follows whatever was picked here on the next boot. One
-# source of truth, as that script's header argues at length.
+# Three things underneath it moved:
+#
+#   xrandr        -> niri msg. niri has no `primary` flag, so "primary" here
+#                    means the output the focused window is on (lib/niri.sh).
+#   displays.xml  -> niri's own config, via ./niri-output.py and an include.
+#                    Same split as before: tell the compositor about now, write
+#                    the profile for later, so a reload does not undo the pick.
+#   five xfconf   -> one number. This is the real simplification of the port.
+#   values           On X11 the panel height, tray icon size, dock size, cursor
+#                    size and Xft DPI were five independent pixel counts that
+#                    all had to be moved together, because none of them
+#                    followed resolution on their own. Wayland has exactly one
+#                    knob for this — the output's `scale` — and every client
+#                    that respects it gets all five right at once. So the tier
+#                    computation still happens, and still lands on a density,
+#                    but it now produces a scale factor instead of a table.
+#
+# There is no Xft DPI on Wayland and nothing here sets one; a scale of 1.5 is
+# how you say "144 dpi" to a Wayland client. XWayland clients are scaled by the
+# compositor rather than re-rendered, so they get the right physical size and a
+# slightly soft one — that is niri's behaviour, not something this can fix.
 #
 #
 # THE UI TIER
 #
-# Panel heights, icon sizes and the cursor are pixel counts — they don't follow
-# resolution, so left alone a preset that quarters the screen leaves a panel
-# eating a sixth of it, and 4K leaves everything half-size. Each preset carries
-# a matching tier for those. Font DPI moves with them, which is the one that
-# does the visible work: it holds text at roughly the same physical size on the
-# glass rather than the same pixel size. Set TIERS_ENABLED=0 to switch
-# resolution and nothing else.
+# The tier is computed from the millimetres in the monitor's EDID and not from
+# the pixel count. Pixel count is the wrong input the moment there is more than
+# one monitor: it says a mode with fewer pixels is a physically larger screen,
+# which holds while one panel changes modes and is false across two. This
+# machine is the counter-example — the 27" 4K is 3840 px over 600 mm (163 dpi)
+# and the laptop is 1366 px over 260 mm (133 dpi), so by pixel count the laptop
+# looks like the roomier screen and by density it is nearly as tight. Dividing
+# pixels by millimetres gets both right, and gets right a monitor neither of us
+# has seen.
 #
-# The tier is computed from the millimetres in the monitor's EDID, which xrandr
-# reports on the output's `connected` line, and not from the pixel count. Pixel
-# count is the wrong input the moment there is more than one monitor: it says a
-# mode with fewer pixels is a physically larger screen, which holds while one
-# panel changes modes and is false across two. This machine is the counter-
-# example — the 27" 4K is 3840 px over 600 mm (163 dpi) and the laptop is 1366
-# px over 256 mm (136 dpi), so by pixel count the laptop looks like the roomier
-# screen and by density it is nearly as tight. Dividing pixels by millimetres
-# gets both right, and gets right a monitor neither of us has seen.
-#
-# So: Xft DPI is the panel's own density times UI_SCALE, and every pixel size
-# below is a 96-dpi baseline scaled by the same ratio. UI_SCALE is the one taste
-# knob — 1.0 renders a point at a true 1/72", and the 0.88 default is a notch
-# under that, sized so the 4K lands on the 144 dpi this was hand-tuned to.
+# UI_SCALE is the one taste knob — 1.0 renders a point at a true 1/72", and the
+# 0.88 default is a notch under that.
 #
 # Density alone is still not enough, because it only says how big a thing ought
 # to be and never asks whether the screen can spare the room. Both panels here
-# are dense, and 0.88 of physical asks for 143 dpi on one and 119 on the other —
-# but 143 dpi buys the 4K a 27x15 inch desktop and 119 buys the laptop a 11x6
-# inch one. The same physical text size costs the small panel most of its
+# are dense, and 0.88 of physical asks for 143 dpi on one and 117 on the other
+# — but 143 dpi buys the 4K a 27x15 inch desktop and 117 buys the laptop an
+# 11x6 inch one. The same physical text size costs the small panel most of its
 # workspace and the big one nothing. Pixels are the budget: a screen with 768
 # rows cannot afford to spend them at the rate a screen with 2160 rows can.
 #
@@ -69,35 +67,29 @@
 # the desktop stays in logical inches, which is a ceiling on DPI. Density says
 # how big; pixel count says how big you can afford; the smaller wins. On the 4K
 # the cap is 270 dpi and never binds. On the laptop it binds at 96, which is
-# where a 1366x768 panel wants to live anyway.
+# where a 1366x768 panel wants to live anyway — i.e. scale 1.0.
 #
-# Usage: resolution [status|highest|fullhd|lowest|retier|--list] [--quiet]
+# The result is quantised to SCALE_STEP. niri accepts arbitrary fractional
+# scales, but the quarter steps are the ones clients and icon themes are
+# actually tested against, and 1.5 looks better than 1.49 for reasons that have
+# nothing to do with arithmetic.
 
 set -euo pipefail
+
+SRC="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=../lib/niri.sh
+. "$SRC/../lib/niri.sh"
+
+KDL="$SRC/niri-output.py"
 
 TIERS_ENABLED=${TIERS_ENABLED:-1}
 FULLHD_PIXELS=$((1920 * 1080))
 
-# Font size as a fraction of true physical scale, and the range it may land in.
-# The clamp is what keeps 640x480 usable: 640 px over 256 mm is 64 dpi, and text
-# that honest is unreadable, so the small end stops at 72 rather than following
-# the arithmetic all the way down.
 UI_SCALE=${UI_SCALE:-0.88}
 DPI_MIN=72
 DPI_MAX=240
-
-# The desktop never gets shorter than this many logical inches, whatever the
-# density works out to. Lower it to trade workspace for bigger text, raise it
-# for the reverse; on this laptop each 0.5" is worth about 6 dpi.
 MIN_WORKSPACE_INCHES=${MIN_WORKSPACE_INCHES:-8.0}
-
-# Panel bar, tray icon, dock and cursor pixel sizes at 96 dpi, scaled linearly
-# from there. Chosen to reproduce the old hand-written tiers: exactly at 72 dpi,
-# within a few pixels at 144.
-BASE_BAR=26
-BASE_ICON=16
-BASE_DOCK=48
-BASE_CURSOR=16
+SCALE_STEP=${SCALE_STEP:-0.25}
 
 QUIET=0
 ACTION=""
@@ -112,30 +104,93 @@ for arg in "$@"; do
 done
 ACTION=${ACTION:-status}
 
-command -v xrandr >/dev/null || { echo "resolution: xrandr not found" >&2; exit 1; }
+# Which display stack to drive. Both are supported and neither is the
+# fallback: this machine has a niri session and an XFCE one, and the same
+# command has to mean the same thing in both.
+BACKEND=$(session_kind)
 
-# Read once and parse many times. Resolving the three presets and deciding
-# which one is active is seven passes over the same mode list, and the tray
-# rebuilds its menu from that on every click — seven xrandr round trips per
-# click is a menu you can feel opening.
-XRANDR_QUERY=$(xrandr --query)
-
-# The output the presets describe. `primary` if anything claims it, else the
-# first connected output — a single-monitor session often flags nothing.
-primary_output() {
-    awk '$2 == "connected" && $3 == "primary" { print $1; exit }' <<<"$XRANDR_QUERY" \
-    | grep . \
-    || awk '$2 == "connected" { print $1; exit }' <<<"$XRANDR_QUERY"
-}
-
-PRIMARY=$(primary_output)
+# Read once and parse many times: resolving three presets and deciding which
+# is active is several passes over the same mode list, and the tray rebuilds
+# its menu from that on every click.
+case $BACKEND in
+    niri)
+        OUTPUTS_JSON=$(niri msg --json outputs 2>/dev/null) || {
+            echo "resolution: could not read outputs from niri" >&2; exit 1; }
+        PRIMARY=$(niri_primary_output)
+        ;;
+    x11)
+        XRANDR_QUERY=$(xrandr --query 2>/dev/null) || {
+            echo "resolution: xrandr failed" >&2; exit 1; }
+        # X11 has an actual primary flag. `primary` if anything claims it,
+        # else the first connected output — a single-monitor session often
+        # flags nothing.
+        PRIMARY=$(awk '$2 == "connected" && $3 == "primary" { print $1; exit }' <<<"$XRANDR_QUERY" \
+                  | grep . \
+                  || awk '$2 == "connected" { print $1; exit }' <<<"$XRANDR_QUERY")
+        ;;
+    *)
+        echo "resolution: no niri session and no X display — nothing to drive" >&2
+        exit 1
+        ;;
+esac
 [[ -n $PRIMARY ]] || { echo "resolution: no connected output" >&2; exit 1; }
 
-# One "WIDTHxHEIGHT RATE" line per mode of $1, carrying that mode's fastest
-# rate. xrandr lists rates across the line with * on the active one and + on
-# the preferred one, both of which have to come off before the number parses.
-modes_of() {
-    awk -v out="$1" '
+# One "WIDTHxHEIGHT RATE" line per mode, rate in Hz to three places. niri
+# reports refresh in millihertz, which is also the precision its own mode
+# strings want, so the conversion happens once here and nowhere else.
+modes_of_niri() {
+    printf '%s' "$OUTPUTS_JSON" | python3 -c '
+import json, sys
+name = sys.argv[1]
+data = json.load(sys.stdin)
+out = data.get(name) or {}
+best = {}
+for mode in out.get("modes", []):
+    key = (mode["width"], mode["height"])
+    rate = mode["refresh_rate"] / 1000.0
+    if rate > best.get(key, 0):
+        best[key] = rate
+for (w, h), rate in best.items():
+    print(f"{w}x{h} {rate:.3f}")
+' "$PRIMARY"
+}
+
+# The active mode as "WIDTHxHEIGHT RATE", or nothing if the output is off.
+current_mode_niri() {
+    printf '%s' "$OUTPUTS_JSON" | python3 -c '
+import json, sys
+name = sys.argv[1]
+out = json.load(sys.stdin).get(name) or {}
+idx = out.get("current_mode")
+modes = out.get("modes") or []
+if idx is not None and 0 <= idx < len(modes):
+    m = modes[idx]
+    w, h = m["width"], m["height"]
+    rate = m["refresh_rate"] / 1000.0
+    print("%dx%d %.3f" % (w, h, rate))
+' "$PRIMARY"
+}
+
+current_scale_niri() {
+    printf '%s' "$OUTPUTS_JSON" | python3 -c '
+import json, sys
+out = json.load(sys.stdin).get(sys.argv[1]) or {}
+print((out.get("logical") or {}).get("scale", ""))
+' "$PRIMARY"
+}
+
+# --------------------------------------------------------------------------
+# The X11 backend.
+#
+# Kept whole rather than reduced to "the old way": under XFCE the five pixel
+# counts really are five independent settings, and there is no single scale to
+# collapse them into. Wayland's `scale` is not a better spelling of Xft DPI,
+# it is a different mechanism, so the two paths compute different things from
+# the same density figure and neither can stand in for the other.
+# --------------------------------------------------------------------------
+
+modes_of_x11() {
+    awk -v out="$PRIMARY" '
         $1 == out && $2 == "connected" { inblock = 1; next }
         /^[^ \t]/ { inblock = 0 }
         inblock && $1 ~ /^[0-9]+x[0-9]+$/ {
@@ -148,8 +203,7 @@ modes_of() {
         }' <<<"$XRANDR_QUERY"
 }
 
-# The active mode as "WIDTHxHEIGHT RATE", or nothing if the output is off.
-current_mode() {
+current_mode_x11() {
     awk -v out="$PRIMARY" '
         $1 == out && $2 == "connected" { inblock = 1; next }
         /^[^ \t]/ { inblock = 0 }
@@ -160,31 +214,17 @@ current_mode() {
         }' <<<"$XRANDR_QUERY"
 }
 
-# Rank every mode by one key and print the winner. Pixel count dominates and
-# refresh rate breaks ties, so each preset is a single comparison: most pixels,
-# fewest pixels, or nearest to 1920x1080 — which degrades gracefully to the
-# closest thing available on a monitor that has no exact Full HD mode.
-choose() {
-    modes_of "$PRIMARY" | awk -v which="$1" -v target="$FULLHD_PIXELS" '
-        {
-            split($1, dim, "x"); pixels = dim[1] * dim[2]; rate = $2 + 0
-            if (which == "highest")     key =  pixels * 1000 + rate
-            else if (which == "lowest") key = -pixels * 1000 + rate
-            else {
-                distance = pixels > target ? pixels - target : target - pixels
-                key = -distance * 1000 + rate
-            }
-            if (!have || key > best) { have = 1; best = key; mode = $1; hz = $2 }
-        }
-        END { if (have) print mode, hz }'
+# X11 has no per-output scale in the sense niri means; the equivalent figure is
+# the Xft DPI the tier sets, reported here so `status` says something true in
+# both sessions.
+current_scale_x11() {
+    xfconf-query -c xsettings -p /Xft/DPI 2>/dev/null | awk '{ printf "%.2f\n", $1 / 96 }'
 }
 
 # The physical width of $PRIMARY in millimetres, from the EDID xrandr prints at
-# the end of the output's `connected` line. Nothing at all when there is no EDID
-# to read it out of, which is a laptop panel behind a driver that doesn't
-# expose one, a KVM, or a monitor that reports 0mm x 0mm — all of which the
-# caller has to fall back for rather than divide by.
-physical_width_mm() {
+# the end of the output's `connected` line. Nothing at all when there is no
+# EDID to read it out of.
+physical_width_mm_x11() {
     awk -v out="$PRIMARY" '
         $1 == out && $2 == "connected" {
             for (i = 3; i < NF - 1; i++)
@@ -214,14 +254,7 @@ tier_from_geometry() {
         }'
 }
 
-# Fallback for an output with no usable EDID: the old pixel-height bands. They
-# are wrong across monitors of different physical sizes — the whole reason the
-# geometry path above exists — but a screen with no EDID has told us nothing
-# better, and these are at least the sizes this ran with for a year.
-#   height >= 1800  4K and up
-#   height >= 1080  Full HD through 1440p
-#   below           the small end
-tier_for_height() {
+tier_for_height_x11() {
     local height=$1
     if   (( height >= 1800 )); then echo "144 43 26 79 26"
     elif (( height >= 1080 )); then echo "96 26 16 48 16"
@@ -231,20 +264,19 @@ tier_for_height() {
 
 xf_try() { xfconf-query "$@" >/dev/null 2>&1 || true; }
 
-# Fit the desktop furniture to $1, a "WIDTHxHEIGHT" mode on $PRIMARY, and echo
-# the tier it used. panel-1 is the top bar (the one holding the systray),
-# panel-2 the dock; a missing one is skipped rather than treated as an error, so
-# this survives the panels being rearranged.
-apply_tier() {
+# Fit the desktop furniture to $1 and echo the scale it works out to, so the
+# caller can print one number in either session. panel-1 is the top bar,
+# panel-2 the dock; a missing one is skipped rather than treated as an error.
+apply_tier_x11() {
     local mode=$1 width height mm tier dpi bar icon dock cursor
     width=${mode%%x*}
     height=${mode#*x}
 
-    mm=$(physical_width_mm)
+    mm=$(physical_width_mm_x11)
     if [[ -n $mm ]]; then
         tier=$(tier_from_geometry "$width" "$height" "$mm")
     else
-        tier=$(tier_for_height "$height")
+        tier=$(tier_for_height_x11 "$height")
     fi
     read -r dpi bar icon dock cursor <<<"$tier"
 
@@ -255,7 +287,7 @@ apply_tier() {
         xf_try -c xfce4-panel  -p /panels/panel-1/icon-size  -s "$icon"
         xf_try -c xfce4-panel  -p /panels/panel-2/size       -s "$dock"
     fi
-    echo "$tier"
+    awk -v d="$dpi" 'BEGIN { printf "%.2f\n", d / 96 }'
 }
 
 # -s alone keeps an existing property's type; -n -t creates one that isn't
@@ -265,7 +297,11 @@ xf_set() {
         || xf_try -c displays -p "$1" -n -t "$2" -s "$3"
 }
 
-persist() {
+# The XFCE profile, written BEFORE xrandr. xfsettingsd re-applies its saved
+# layout on RandR events, so an xrandr call it does not know about is a change
+# with a timer on it. This is the opposite order from the niri path, and the
+# reason is symmetrical — see apply_mode below.
+persist_x11() {
     local profile
     profile=$(xfconf-query -c displays -p /ActiveProfile 2>/dev/null || true)
     [[ -n $profile ]] || profile=Default
@@ -273,6 +309,137 @@ persist() {
     xf_set "/$profile/$PRIMARY/RefreshRate" double "$2"
     xf_set "/$profile/$PRIMARY/Scale"       double 1.0
     xf_set "/$profile/$PRIMARY/Active"      bool   true
+}
+
+
+# --------------------------------------------------------------------------
+# Dispatch. Everything above this line is backend-specific; everything below
+# it — choose(), preset_of(), label_of(), the action block — is not, and never
+# learns which session it is in.
+# --------------------------------------------------------------------------
+
+modes_of()      { "modes_of_${BACKEND}"; }
+current_mode()  { "current_mode_${BACKEND}"; }
+current_scale() { "current_scale_${BACKEND}"; }
+apply_tier()    { "apply_tier_${BACKEND}" "$@"; }
+
+# Set the mode, and record it so it survives whatever else re-applies a layout.
+#
+# The ORDER differs between the two and both orders are deliberate:
+#
+#   x11   profile first. xfsettingsd re-applies displays.xml on every RandR
+#         event, so writing it second means the daemon overwrites the change
+#         a moment after it lands.
+#   niri  compositor first. Nothing races us, and writing the config first
+#         makes niri reload and re-apply mid-change.
+apply_mode() {
+    local mode=$1 rate=$2
+    case $BACKEND in
+        niri)
+            niri msg output "$PRIMARY" mode "${mode}@${rate}" >/dev/null
+            python3 "$KDL" set "$PRIMARY" "${mode}@${rate}" -
+            ;;
+        x11)
+            persist_x11 "$mode" "$rate"
+            # --scale 1x1 always: this display spent a while running a
+            # 2328x1310 desktop bilinear-upscaled to 4K, and switching modes
+            # without clearing the transform composes the two.
+            xrandr --output "$PRIMARY" --mode "$mode" --rate "$rate" --scale 1x1 --primary
+            ;;
+    esac
+}
+
+
+# Rank every mode by one key and print the winner. Pixel count dominates and
+# refresh rate breaks ties, so each preset is a single comparison: most pixels,
+# fewest pixels, or nearest to 1920x1080 — which degrades gracefully to the
+# closest thing available on a monitor that has no exact Full HD mode.
+choose() {
+    modes_of | awk -v which="$1" -v target="$FULLHD_PIXELS" '
+        {
+            split($1, dim, "x"); pixels = dim[1] * dim[2]; rate = $2 + 0
+            if (which == "highest")     key =  pixels * 1000 + rate
+            else if (which == "lowest") key = -pixels * 1000 + rate
+            else {
+                distance = pixels > target ? pixels - target : target - pixels
+                key = -distance * 1000 + rate
+            }
+            if (!have || key > best) { have = 1; best = key; mode = $1; hz = $2 }
+        }
+        END { if (have) print mode, hz }'
+}
+
+# The scale for a mode $1 x $2 pixels on a screen $3 mm wide.
+scale_from_geometry() {
+    awk -v px="$1" -v py="$2" -v mm="$3" -v scale="$UI_SCALE" \
+        -v lo="$DPI_MIN" -v hi="$DPI_MAX" -v minin="$MIN_WORKSPACE_INCHES" \
+        -v step="$SCALE_STEP" '
+        BEGIN {
+            dpi = px * 25.4 / mm * scale            # what the glass asks for
+            cap = py / minin                        # what the pixel budget allows
+            if (dpi > cap) dpi = cap
+            if (dpi < lo)  dpi = lo
+            if (dpi > hi)  dpi = hi
+            s = dpi / 96
+            s = int(s / step + 0.5) * step
+            if (s < 1) s = 1                        # niri will not scale below 1
+            printf "%.2f\n", s
+        }'
+}
+
+# Fallback for an output with no usable EDID: the old pixel-height bands,
+# expressed as scales. Wrong across monitors of different physical sizes — the
+# whole reason the geometry path exists — but a screen with no EDID has told us
+# nothing better.
+scale_for_height() {
+    local height=$1
+    if   (( height >= 1800 )); then echo "1.50"
+    elif (( height >= 1080 )); then echo "1.00"
+    else                            echo "1.00"
+    fi
+}
+
+# Fit the UI to $1, a "WIDTHxHEIGHT" mode on $PRIMARY, and echo the scale used.
+apply_tier_niri() {
+    local mode=$1 width height mm scale
+    width=${mode%%x*}
+    height=${mode#*x}
+
+    mm=$(niri_physical_width_mm "$PRIMARY")
+    if [[ -n $mm ]]; then
+        scale=$(scale_from_geometry "$width" "$height" "$mm")
+    else
+        scale=$(scale_for_height "$height")
+    fi
+
+    if (( TIERS_ENABLED )); then
+        niri msg output "$PRIMARY" scale "$scale" >/dev/null 2>&1 || true
+        python3 "$KDL" set "$PRIMARY" - "$scale" || true
+    fi
+    echo "$scale"
+}
+
+# Push the layout to the login screen.
+#
+# This is what monitor-greeter used to do the hard way. Under LightDM there was
+# no mechanism for it at all: that script ran as root out of a display-setup
+# hook, dropped privileges to read the user's displays.xml, re-validated every
+# field, and rebuilt the layout with xrandr before the greeter drew — several
+# hundred lines to work around a greeter that started X with no configuration
+# and put the login box on whichever monitor happened to be first.
+#
+# noctalia's greeter is told directly, in one call, and the argument for doing
+# it here is the one that script's header made at length: one source of truth.
+# Change the mode and the login screen follows on the next boot, with nothing
+# to keep in sync and no way for the two to drift apart.
+sync_greeter() {
+    # noctalia only. Under XFCE the greeter half is monitor-greeter's LightDM
+    # hook, which is installed separately and reads displays.xml on its own —
+    # persist_x11 has already written it by the time this is reached, so the
+    # login screen is in sync there too, just by a different route.
+    [[ $BACKEND == niri ]] || return 0
+    command -v noctalia >/dev/null 2>&1 || return 0
+    noctalia msg greeter-sync >/dev/null 2>&1 || true
 }
 
 # Which preset, if any, the given mode is. Compared by resolution only: the
@@ -307,7 +474,7 @@ case $ACTION in
     status)
         active=$(current_mode)
         [[ -n $active ]] || { echo "$PRIMARY is off"; exit 0; }
-        echo "$PRIMARY: ${active%% *} @ ${active##* } Hz ($(label_of "$(preset_of "${active%% *}")"))"
+        echo "$PRIMARY: ${active%% *} @ ${active##* } Hz ($(label_of "$(preset_of "${active%% *}")"), scale $(current_scale), $BACKEND)"
         ;;
 
     highest|fullhd|lowest)
@@ -315,32 +482,29 @@ case $ACTION in
         [[ -n $target ]] || { echo "resolution: $PRIMARY has no $ACTION mode" >&2; exit 1; }
         mode=${target%% *}; rate=${target##* }
 
-        # Profile before xrandr, so xfsettingsd's copy already agrees by the
-        # time the RandR change reaches it. The mode came out of xrandr's own
-        # list, so there is no plausible way to persist one it will refuse.
-        persist "$mode" "$rate"
-        xrandr --output "$PRIMARY" --mode "$mode" --rate "$rate" --scale 1x1 --primary
-        apply_tier "$mode" >/dev/null
+        apply_mode "$mode" "$rate"
+        scale=$(apply_tier "$mode")
+        sync_greeter
 
         (( QUIET )) || {
             command -v notify-send >/dev/null && notify-send \
                 -i preferences-desktop-display-symbolic -t 2500 \
-                "$(label_of "$ACTION")" "$PRIMARY — $mode @ ${rate} Hz"
+                "$(label_of "$ACTION")" "$PRIMARY — $mode @ ${rate} Hz, scale $scale"
         }
-        echo "$PRIMARY: $mode @ ${rate} Hz ($(label_of "$ACTION"))"
+        echo "$PRIMARY: $mode @ ${rate} Hz ($(label_of "$ACTION"), scale $scale, $BACKEND)"
         ;;
 
     # Re-fit the UI to the mode that is already set, without touching it. This
     # is the undock case: pulling the cable is a layout change nobody ran
-    # `resolution` for, so the DPI picked for the monitor that just left stays
-    # applied to the one still here. resolution-tray.py calls this on every
-    # RandR event; it is idempotent, so the extra one after a preset switch
-    # rewrites the same five values.
+    # `resolution` for, so the scale picked for the monitor that just left
+    # stays applied to the one still here. resolution-tray.py calls this on
+    # every output change; it is idempotent.
     retier)
         active=$(current_mode)
         [[ -n $active ]] || { echo "$PRIMARY is off"; exit 0; }
         mode=${active%% *}
-        read -r dpi bar icon dock cursor <<<"$(apply_tier "$mode")"
-        (( QUIET )) || echo "$PRIMARY: $mode — ${dpi} dpi, bar $bar, icons $icon, dock $dock, cursor $cursor"
+        scale=$(apply_tier "$mode")
+        sync_greeter
+        (( QUIET )) || echo "$PRIMARY: $mode — scale $scale"
         ;;
 esac

@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# gamma-apply <kelvin> — put the screen at a colour temperature and keep it
+# there. Also: --backend (name the one in use), --stop (release the ramp).
+#
+# WHY THIS FILE EXISTS AT ALL
+#
+# On X11 a gamma ramp is server state, so `redshift -P -O 4000` could set it
+# and exit and the screen stayed warm — which is exactly what the old
+# nightlight did, once per call, with no daemon anywhere.
+#
+# Wayland does not work that way. The ramp belongs to the client that set it
+# through wlr-gamma-control, and the compositor restores the original the
+# moment that client disconnects. A one-shot set is therefore a no-op with a
+# flicker in it: the process exits and takes the colour with it. Something has
+# to stay alive holding the control for as long as the screen is meant to be
+# warm.
+#
+# So this is the piece the port needed and X11 never did: a single place that
+# owns "the screen is at K right now", whatever tool is doing the holding. The
+# schedule, the override and the mode logic in nightlight/nightlight-auto are
+# unchanged from the XFCE version — they still just ask for a number.
+#
+#
+# BACKENDS, BEST FIRST
+#
+#   wl-gammarelay-rs  A daemon whose whole job is this, driven over D-Bus. The
+#                     only one that can retune without restarting anything, so
+#                     it never flickers and a slider drag costs one D-Bus call
+#                     instead of a process launch. Worth having.
+#   gammastep         redshift's Wayland fork. Pinned to a constant by handing
+#                     it the same temperature for day and night, which makes
+#                     the location it would otherwise want irrelevant.
+#   wlsunset          Same idea, different flags: the day window is squeezed to
+#                     one minute at midnight so the night temperature is what
+#                     is on screen essentially always.
+#   redshift          X11 only, and kept solely so this still works if you log
+#                     into an X session. Genuinely one-shot there.
+#
+# THE RESPAWN BACKENDS ARE SWAPPED OLD-FIRST, AND IT IS NOT A CHOICE
+#
+# This used to start the replacement before killing the old process, on the
+# reasoning that the compositor would then never see a moment with no client
+# holding the ramp and the screen would never flash back to cold. That is a
+# good instinct and it cannot work, because wlr-gamma-control is *exclusive*:
+# one client per output. Ask for a control another client already holds and the
+# compositor answers `failed`, which gammastep reports as
+#
+#     Warning: Zero outputs support gamma adjustment.
+#     Warning: 1/1 output(s) do not support gamma adjustment.
+#
+# — and then never retries, not when the old holder exits, not ever. Measured:
+# a second gammastep was still saying nothing six seconds after the first was
+# stopped.
+#
+# So the old order produced exactly the flash it was written to prevent, only
+# permanent: new holder refused, old holder killed, nobody holding the ramp,
+# screen at neutral until the next apply happened to find the control free. On
+# alternate calls it worked, which is what made it look intermittent.
+#
+# Stopping first means a real gap, for as long as the replacement takes to
+# start — a tenth of a second or so, once, instead of a coin-flip between
+# correct and neutral. The way to have no gap at all is wl-gammarelay-rs, which
+# never restarts anything; that is why it is first in the list.
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nightlight"
+PIDFILE="$STATE/gamma.pid"
+UNITFILE="$STATE/gamma.unit"
+BACKEND_FILE="$STATE/gamma.backend"
+# Serialising a respawn, and coalescing the ones that pile up behind it — see
+# apply_respawn.
+LOCKFILE="$STATE/gamma.lock"
+WANTFILE="$STATE/gamma.want"
+# One shared daemon, so one fixed unit name — see relay_start.
+RELAY_UNIT=nightlight-gamma-relay.service
+
+mkdir -p "$STATE"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Which tool to use. wl-gammarelay-rs and wl-gammarelay are the same program
+# under two package names; either is fine.
+pick_backend() {
+    if [[ -n ${NIGHTLIGHT_BACKEND:-} ]]; then
+        printf '%s\n' "$NIGHTLIGHT_BACKEND"
+        return
+    fi
+    if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+        have wl-gammarelay-rs && { echo wl-gammarelay-rs; return; }
+        have wl-gammarelay    && { echo wl-gammarelay;    return; }
+        have gammastep        && { echo gammastep;        return; }
+        have wlsunset         && { echo wlsunset;         return; }
+        # Deliberately NOT falling through to redshift here. XWayland gives it
+        # an X server to talk to, so it reports success, sets a gamma ramp on
+        # the rootless X server nobody composites, and changes nothing on the
+        # glass. A clear failure beats a silent one.
+        echo none
+        return
+    fi
+    have redshift && { echo redshift; return; }
+    echo none
+}
+
+# --- wl-gammarelay ---------------------------------------------------------
+# Idempotent: the daemon is started only if the bus name is missing, and the
+# temperature is a property write, so repeated calls cost one round trip.
+
+# The bus name and the interface name are NOT the same string, and the
+# difference is not cosmetic: D-Bus interface names may not contain a hyphen,
+# so `rs.wl-gammarelay` is a perfectly good bus name and an illegal interface.
+# Passing it as one gets "Invalid interface name" from busctl and nothing else
+# — which, with the 2>/dev/null on the call below, is a temperature that
+# silently never lands.
+RELAY_BUS=rs.wl-gammarelay
+RELAY_IFACE=rs.wl.gammarelay
+RELAY_PATH=/
+
+relay_running() {
+    busctl --user status "$RELAY_BUS" >/dev/null 2>&1
+}
+
+relay_start() {  # relay_start <binary>
+    relay_running && return 0
+
+    # NOT `setsid ... &`, for exactly the reason respawn() does not use it
+    # either — see the cgroup note below. The usual caller is nightlight-auto,
+    # a Type=oneshot unit, and KillMode=control-group takes every process in
+    # that cgroup down when its main process exits. setsid changes the session
+    # and the process group, neither of which is the cgroup, so the daemon
+    # would be shot about 400ms after the timer that started it.
+    #
+    # This path had the bug the respawn path was fixed for, and would only have
+    # shown up once a relay backend was installed: started from a terminal or
+    # the tray it works, started by the five-minute tick it dies. Intermittent
+    # and for no visible reason, which is the worst way to find out.
+    if command -v systemd-run >/dev/null 2>&1 && [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+        # A fixed unit name, unlike respawn's unique ones: there is exactly one
+        # relay daemon and it is shared, so a second launch should collide with
+        # the first rather than start a rival. systemd-run fails when the unit
+        # already exists, which is a success for our purposes — the poll below
+        # is the real test either way.
+        systemd-run --user --collect --quiet --unit="$RELAY_UNIT" \
+            "$1" >/dev/null 2>&1 || true
+    else
+        setsid "$1" >/dev/null 2>&1 </dev/null &
+    fi
+
+    local i
+    for i in $(seq 40); do
+        relay_running && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
+relay_set() {  # relay_set <binary> <kelvin>
+    relay_start "$1" || return 1
+    # stderr is kept rather than discarded. The whole reason this path shipped
+    # broken is that the only evidence of it — "Invalid interface name" — was
+    # being thrown away, leaving a backend that reported failure with no hint
+    # as to why. A D-Bus error here is worth reading.
+    busctl --user set-property "$RELAY_BUS" "$RELAY_PATH" "$RELAY_IFACE" \
+        Temperature q "$2"
+}
+
+# --- respawn backends ------------------------------------------------------
+
+# The command line that pins a backend to one temperature, as an argv array in
+# $REPLY_CMD. Kept in one place so the ordering dance below stays generic.
+declare -a REPLY_CMD=()
+build_cmd() {  # build_cmd <backend> <kelvin>
+    local backend=$1 kelvin=$2
+    REPLY_CMD=()
+    case $backend in
+        gammastep)
+            # -t day:night with both equal is a constant, which makes -l moot;
+            # it is still required, so it gets a fixed nowhere. -r drops the
+            # fade, so a slider drag lands immediately instead of easing.
+            REPLY_CMD=(gammastep -m wayland -t "${kelvin}:${kelvin}" -l 0:0 -r)
+            ;;
+        wlsunset)
+            # wlsunset refuses a high that is not above the low, so the high is
+            # one kelvin up and never reached: sunrise 23:59 to sunset 00:00
+            # leaves a one-minute day, and the night temperature is what is on
+            # screen the rest of the time. -d 1 keeps the crossing instant.
+            REPLY_CMD=(wlsunset -T "$((kelvin + 1))" -t "$kelvin" -S 23:59 -s 00:00 -d 1)
+            ;;
+    esac
+}
+
+# Start the new holder, wait for it to actually take the control, then retire
+# the old one. Order matters: killing first would hand the ramp back to the
+# compositor for as long as the new process takes to start, which is a visible
+# white flash on every schedule tick.
+#
+# WHY THE HOLDER GETS ITS OWN SYSTEMD UNIT
+#
+# Because a plain background process does not survive its caller, and the
+# caller here is a Type=oneshot service.
+#
+# nightlight-auto.timer runs nightlight-auto as a oneshot. systemd's default
+# KillMode is control-group: when the main process of a oneshot exits, systemd
+# kills everything still in that unit's cgroup. A `setsid gammastep &` from
+# inside it is in that cgroup, so it was being killed roughly 400ms after it
+# started — measured, from the journal:
+#
+#     22:46:55.484  Starting Set night light intensity based on time of day...
+#     22:46:55.872  Finished Set night light intensity based on time of day.
+#
+# The visible symptom is the screen going warm for about half a second on every
+# tick and then snapping back to neutral, because the compositor restores the
+# original ramp the moment the client holding wlr-gamma-control goes away. It
+# looks exactly like something else fighting over gamma, and nothing was: the
+# holder was being shot in the back by its own parent unit.
+#
+# setsid does not help — it changes the session and process group, neither of
+# which is the cgroup. `systemd-run --user` is what actually moves the process
+# into a unit of its own, which is then nobody's child to clean up. The same
+# applies to nightlight-login, which XDG autostart also runs as a service.
+#
+# Each launch gets a unique unit name so the new holder can be up before the
+# old one is stopped; --collect has systemd reap the unit once it exits.
+respawn() {  # respawn <backend> <kelvin>
+    build_cmd "$1" "$2"
+    [[ ${#REPLY_CMD[@]} -gt 0 ]] || return 1
+
+    # Release the gamma control before asking for it. The header says why this
+    # is the only order that works; the short version is that the compositor
+    # refuses a second client and gammastep does not retry.
+    retire_holder
+
+    local new_pid="" new_unit=""
+
+    if command -v systemd-run >/dev/null 2>&1 && [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+        new_unit="nightlight-gamma-$$-${RANDOM}.service"
+        if ! systemd-run --user --collect --quiet --unit="$new_unit" \
+                 "${REPLY_CMD[@]}" >/dev/null 2>&1; then
+            echo "gamma-apply: systemd-run could not start $1" >&2
+            return 1
+        fi
+        sleep "$SETTLE"
+        new_pid=$(systemctl --user show "$new_unit" -p MainPID --value 2>/dev/null)
+        if [[ ! $new_pid =~ ^[0-9]+$ ]] || (( new_pid == 0 )); then
+            echo "gamma-apply: $1 exited immediately — check its arguments" >&2
+            systemctl --user stop "$new_unit" >/dev/null 2>&1 || true
+            return 1
+        fi
+    else
+        # No user systemd (a TTY login, an X session started some other way).
+        # Nothing is going to clean up the cgroup either, so a bare background
+        # process is fine here.
+        setsid "${REPLY_CMD[@]}" >/dev/null 2>&1 </dev/null &
+        new_pid=$!
+        sleep "$SETTLE"
+        if ! kill -0 "$new_pid" 2>/dev/null; then
+            echo "gamma-apply: $1 exited immediately — check its arguments" >&2
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$new_pid"  >"$PIDFILE"
+    printf '%s\n' "$new_unit" >"$UNITFILE"
+    return 0
+}
+
+# Stop whatever this script last recorded as the holder, and forget it. Shared
+# by the swap and by --stop; `systemctl stop` is synchronous, so by the time
+# this returns the gamma control really is free for the next client to take.
+retire_holder() {
+    local pid="" unit=""
+    [[ -f $PIDFILE ]]  && pid=$(cat "$PIDFILE" 2>/dev/null)
+    [[ -f $UNITFILE ]] && unit=$(cat "$UNITFILE" 2>/dev/null)
+    if [[ -n $unit ]]; then
+        systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    elif [[ -n $pid ]]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE" "$UNITFILE"
+}
+
+stop_holder() {
+    retire_holder
+    if relay_running; then
+        # Neutral rather than killed: the daemon is cheap to leave running and
+        # something else may be relying on the bus name being there.
+        busctl --user set-property "$RELAY_BUS" "$RELAY_PATH" "$RELAY_IFACE" \
+            Temperature q 6500 2>/dev/null || true
+    fi
+}
+
+# --- coalescing -------------------------------------------------------------
+
+# How long to wait before deciding the new holder started successfully. It only
+# has to outlive an argument error, which gammastep manages in about ten
+# milliseconds, and with the old holder already stopped every millisecond spent
+# here is a millisecond of neutral screen.
+SETTLE=0.15
+
+# One respawn at a time, and only the newest value survives a queue.
+#
+# WHY THIS IS NOT OVER-ENGINEERING FOR A COLOUR TEMPERATURE
+#
+# A respawn is a process launch, a settle, and a synchronous `systemctl stop`,
+# so it is the better part of a second. The night light panel applies live
+# while the slider is dragged, coalesced to one call per 40ms, which is right
+# for wl-gammarelay-rs — a D-Bus property write, microseconds — and hopeless
+# here: a two-second drag asks for fifty respawns, each one killing the holder
+# the last one started, and they interleave. The screen spends the drag at
+# neutral and lands wherever the race finished.
+#
+# So the first caller takes the lock and everyone behind it simply writes what
+# they want and leaves. The holder re-reads that file after each apply and goes
+# round again if it changed, which means the last value asked for is always the
+# one that ends up on screen, and the values nobody is looking at any more are
+# skipped instead of queued.
+apply_respawn() {  # apply_respawn <backend> <kelvin>
+    local backend=$1
+    printf '%s\n' "$2" >"$WANTFILE"
+
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        # Somebody else is mid-swap. They will pick the value above up before
+        # they finish, so there is nothing left to do here.
+        return 0
+    fi
+
+    local want applied=""
+    while :; do
+        want=$(cat "$WANTFILE" 2>/dev/null)
+        [[ $want =~ ^[0-9]+$ ]] || want=$2
+        [[ $want == "$applied" ]] && break
+        respawn "$backend" "$want" || return 1
+        applied=$want
+    done
+    return 0
+}
+
+# --- main ------------------------------------------------------------------
+
+backend=$(pick_backend)
+
+case ${1-} in
+    --backend)
+        printf '%s\n' "$backend"
+        exit 0
+        ;;
+    --stop)
+        stop_holder
+        exit 0
+        ;;
+    "")
+        echo "usage: ${0##*/} <kelvin> | --backend | --stop" >&2
+        exit 2
+        ;;
+esac
+
+kelvin=$1
+if ! [[ $kelvin =~ ^[0-9]+$ ]] || (( kelvin < 1000 || kelvin > 10000 )); then
+    echo "gamma-apply: kelvin out of range: $kelvin" >&2
+    exit 2
+fi
+
+# Installing a better backend changes the answer from pick_backend, and the
+# holder started by the previous one is still sitting on the gamma control. It
+# is exclusive, so leaving it there means the new backend is refused and
+# nothing changes on screen — the install would look like it did not work.
+# Retiring it here is what makes `pacman -S` the whole of the upgrade.
+previous=$(cat "$BACKEND_FILE" 2>/dev/null || true)
+if [[ -n $previous && $previous != "$backend" ]]; then
+    retire_holder
+fi
+printf '%s\n' "$backend" >"$BACKEND_FILE"
+
+case $backend in
+    wl-gammarelay-rs|wl-gammarelay)
+        relay_set "$backend" "$kelvin" || {
+            echo "gamma-apply: $backend would not take $kelvin" >&2
+            exit 1
+        }
+        ;;
+    gammastep|wlsunset)
+        apply_respawn "$backend" "$kelvin" || exit 1
+        ;;
+    redshift)
+        # -P resets the existing ramp first; without it redshift stacks each
+        # adjustment on the last and the screen creeps redder on every call.
+        redshift -P -O "$kelvin" >/dev/null 2>&1 || exit 1
+        ;;
+    none)
+        echo "gamma-apply: no gamma backend installed." >&2
+        echo "  Wayland:  sudo pacman -S gammastep      (or wlsunset)" >&2
+        echo "  best:     wl-gammarelay-rs from the AUR — no restart per change" >&2
+        exit 1
+        ;;
+esac

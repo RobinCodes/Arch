@@ -28,7 +28,19 @@ GPU=(/sys/class/drm/card[0-9]*)
 # The "no restriction" values, for the profiles that lift one. These are not
 # used to fake a baseline — see restore().
 STOCK_MAX_PERF=100
-STOCK_LAPTOP_MODE=0
+# vm.laptop_mode is gone from this file on purpose. The kernel dropped it —
+# 7.2 answers a write with
+#
+#     bash: vm.laptop_mode is deprecated. Ignoring setting.
+#
+# on the *console*, at KERN_WARNING, which is the orange line that flashes past
+# during boot when the battery tray reapplies a saved profile at login. The
+# write did nothing either way: /proc/sys/vm/laptop_mode reads 0 straight after
+# being set to 5.
+#
+# Nothing is lost by dropping it. What laptop_mode contributed to was batching
+# writeback, and dirty_writeback_centisecs below does that directly and still
+# works. Do not put it back.
 STOCK_WRITEBACK=500
 STOCK_NMI=1
 
@@ -114,7 +126,6 @@ snapshot() {
         echo "gpu_max=$(peek "${GPU[@]/%//gt_max_freq_mhz}")"
         echo "snd=$(peek /sys/module/snd_hda_intel/parameters/power_save)"
         echo "aspm=$(peek_bracketed /sys/module/pcie_aspm/parameters/policy)"
-        echo "laptop_mode=$(peek /proc/sys/vm/laptop_mode)"
         echo "writeback=$(peek /proc/sys/vm/dirty_writeback_centisecs)"
         echo "nmi=$(peek /proc/sys/kernel/nmi_watchdog)"
     } >"$BASELINE.tmp" 2>/dev/null && mv "$BASELINE.tmp" "$BASELINE"
@@ -133,7 +144,7 @@ restore() {
     [[ -r $BASELINE ]] || return 0
 
     local governor="" epp="" no_turbo="" max_perf="" gpu_max=""
-    local snd="" aspm="" laptop_mode="" writeback="" nmi=""
+    local snd="" aspm="" writeback="" nmi=""
     local key value
 
     while IFS='=' read -r key value; do
@@ -148,7 +159,6 @@ restore() {
             gpu_max) gpu_max=$value ;;
             snd) snd=$value ;;
             aspm) aspm=$value ;;
-            laptop_mode) laptop_mode=$value ;;
             writeback) writeback=$value ;;
             nmi) nmi=$value ;;
         esac
@@ -160,7 +170,6 @@ restore() {
     set_gpu_max "$gpu_max"
     poke "$snd" /sys/module/snd_hda_intel/parameters/power_save
     poke "$aspm" /sys/module/pcie_aspm/parameters/policy
-    poke "$laptop_mode" /proc/sys/vm/laptop_mode
     poke "$writeback" /proc/sys/vm/dirty_writeback_centisecs
     poke "$nmi" /proc/sys/kernel/nmi_watchdog
 
@@ -187,7 +196,6 @@ apply_performance() {
     # sound after silence.
     poke 0 /sys/module/snd_hda_intel/parameters/power_save
     poke performance /sys/module/pcie_aspm/parameters/policy
-    poke "$STOCK_LAPTOP_MODE" /proc/sys/vm/laptop_mode
     poke "$STOCK_WRITEBACK" /proc/sys/vm/dirty_writeback_centisecs
     poke "$STOCK_NMI" /proc/sys/kernel/nmi_watchdog
 }
@@ -204,7 +212,6 @@ apply_saver() {
     poke 1 /sys/module/snd_hda_intel/parameters/power_save
     poke powersave /sys/module/pcie_aspm/parameters/policy
     # Batch writeback so the disk gets longer idle runs.
-    poke 5 /proc/sys/vm/laptop_mode
     poke 1500 /proc/sys/vm/dirty_writeback_centisecs
     poke "$STOCK_NMI" /proc/sys/kernel/nmi_watchdog
 }
@@ -226,7 +233,6 @@ apply_extreme() {
 
     poke 1 /sys/module/snd_hda_intel/parameters/power_save
     poke powersupersave /sys/module/pcie_aspm/parameters/policy
-    poke 5 /proc/sys/vm/laptop_mode
     poke 6000 /proc/sys/vm/dirty_writeback_centisecs
     # Costs a timer interrupt per core per second; the tradeoff is losing
     # hard-lockup detection, which is why it's only given up at this level.

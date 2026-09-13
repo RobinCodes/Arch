@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
-"""Battery tray icon for XFCE: the charge percentage drawn as text in the
-panel, with the charging state carried by a lightning bolt and by colour.
+"""Power-profile tray icon: which of the four profiles is on, drawn as a
+level marker in the bar.
 
-The panel gives a tray icon a small square (16px here), so the digits are
-fitted to that box rather than drawn at a fixed size — "100" simply renders
-smaller than "72" instead of spilling out of the icon.
+    ++   performance          every ceiling off
+    +    default             the machine as it came
+    -    battery saver       turbo off, deeper idle states
+    --   extreme saver       saver plus hard frequency ceilings
 
-Colour encodes the state at a glance:
+WHY IT IS NOT THE CHARGE PERCENTAGE ANY MORE
 
-  green   charging
-  amber   on battery, at or below LOW_PERCENT
-  red     on battery, at or below CRITICAL_PERCENT
-  panel   anything else (discharging normally, full, or held by a
-          charge threshold)
+It used to draw the battery percentage, with a bolt for charging, colour for
+low and critical, and a bar along the bottom for the active profile — four
+things fighting over a 32px square, and the profile, the only one of them this
+tray can actually change, got the smallest share.
 
-The menu also carries the four power profiles — performance, default, battery
-saver and extreme battery saver — which are handed off to the sibling
-power-profile script, the single owner of that state. Anything other than
-default shows as a bar along the bottom of the icon.
+noctalia's own battery widget is already on the bar and already shows charge,
+state and time. So the number here was a second, worse copy of something two
+centimetres away, and everything drawn around it existed to work around how
+little room the number left. Dropping it leaves the icon saying the one thing
+nothing else on the bar says, in the space that was being split four ways.
 
-The same menu carries the AC follow: with it on, plugging in switches to
-performance and unplugging puts back whatever was on before. This file only
-spots the transition — the AC line is already read every poll for the charging
-colour — and hands it to `power-profile --sync`, which owns the decision and
-the memory of what to hand back.
+Charge has not gone anywhere — it is in the tooltip, in full, along with time
+remaining and battery health.
+
+Colour still carries the direction the profile points: violet for faster than
+stock, teal for slower, and the bar's own foreground for stock itself, so the
+two saving profiles read as a pair and neither reads as an alarm.
+
+The menu carries the four profiles, handed off to the sibling power-profile
+script, the single owner of that state. It also carries the AC follow: with it
+on, plugging in switches to performance and unplugging puts back whatever was
+on before. This file only spots the transition — the AC line is already read
+every poll — and hands it to `power-profile --sync`, which owns the decision
+and the memory of what to hand back.
 
 The battery side is read straight from sysfs, so it needs nothing beyond
 PyGObject."""
@@ -31,6 +40,7 @@ PyGObject."""
 import glob
 import os
 import subprocess
+import sys
 import warnings
 
 import cairo
@@ -40,24 +50,34 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import tray  # noqa: E402
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 POLL_INTERVAL_MS = 5000
-LOW_PERCENT = 20
-CRITICAL_PERCENT = 10
-FALLBACK_ICON_SIZE = 16
+# The panel used to hand its icon size over through size-changed. A
+# StatusNotifierItem has no such conversation — the bar takes the picture and
+# scales it — so the icon is drawn once at a size big enough to survive being
+# scaled down to whatever the bar is using. 32 rather than 16 because a bar at
+# scale 2, or simply a taller bar, would otherwise show a blurry upscale of a
+# 16px bitmap.
+ICON_SIZE = 32
+FALLBACK_ICON_SIZE = ICON_SIZE
 
-# Share of the icon's height the digits get. Charging gives up the top of the
-# box to the bolt and an active profile the bottom to its bar; all three must
-# sum to no more than 1 to stay disjoint.
-TEXT_FRACTION = 0.94
-CHARGING_TEXT_FRACTION = 0.60
-BOLT_FRACTION = 0.40
-MARKER_FRACTION = 0.22
+# The marks are drawn, not typeset. Scaling "+" and "-" as glyphs to a common
+# box cannot produce a set: a hyphen's ink is a third as wide and a tenth as
+# tall as a plus sign's, so fitting either one to the square makes the other
+# absurd — fit by width and the dashes come out as fat blocks, fit by height
+# and they vanish. Two rectangles with a shared length and thickness have no
+# such problem, and are crisper at 32px than hinted glyphs would be anyway.
+#
+# One symbol is the same size as each of two, so the count is what carries the
+# level: + then ++, - then --.
+MARK_LENGTH_FRACTION = 0.38
+MARK_THICKNESS_FRACTION = 0.105
+MARK_GAP_FRACTION = 0.13
 
-CHARGING_RGB = (0.55, 0.80, 0.35)
-LOW_RGB = (0.96, 0.71, 0.20)
-CRITICAL_RGB = (0.93, 0.35, 0.32)
 SAVER_RGB = (0.35, 0.74, 0.86)
 PERFORMANCE_RGB = (0.78, 0.55, 0.95)
 # Used when the panel is in dark mode, where the GTK theme's foreground
@@ -65,7 +85,10 @@ PERFORMANCE_RGB = (0.78, 0.55, 0.95)
 DARK_PANEL_RGB = (0.93, 0.93, 0.93)
 
 POWER_SUPPLY_DIR = "/sys/class/power_supply"
-SETTINGS_BIN = "xfce4-power-manager-settings"
+# noctalia's settings window. The XFCE power manager it used to open does not
+# exist here, and nothing in this session owns the same set of knobs — the four
+# profiles in this menu are this repo's own, written straight to sysfs.
+SETTINGS_ARGV = ("noctalia", "msg", "settings-open")
 
 # Resolved from this file so the Scripts folder stays movable.
 POWER_PROFILE_BIN = os.path.join(
@@ -81,23 +104,24 @@ AUTO_FILE = os.path.join(STATE_DIR, "auto")
 # the profile that will be put back on unplug.
 AC_RESTORE_FILE = os.path.join(STATE_DIR, "ac-restore")
 DEFAULT_PROFILE = "default"
-# name, menu label, bar width as a share of the icon's, bar colour, tooltip
+# name, menu label, icon marker, marker colour (None = the bar's own
+# foreground), tooltip
 PROFILES = (
-    ("performance", "Performance", 0.90, PERFORMANCE_RGB,
+    ("performance", "Performance", "++", PERFORMANCE_RGB,
      "Every ceiling off, CPU and GPU biased hard toward speed. Holds on "
      "battery too — picking it here is a pin, not a preference AC gets to "
      "undo"),
-    ("default", "Default", 0.0, None,
+    ("default", "Default", "+", None,
      "The machine as it was before any profile was applied — on this laptop "
      "that already means turbo on and no frequency caps"),
-    ("saver", "Battery Saver", 0.50, SAVER_RGB,
+    ("saver", "Battery Saver", "-", SAVER_RGB,
      "Turbo off, deeper idle states, batched disk writeback"),
-    ("extreme", "Extreme Battery Saver", 0.90, SAVER_RGB,
+    ("extreme", "Extreme Battery Saver", "--", SAVER_RGB,
      "Battery saver plus hard CPU and GPU frequency ceilings — "
      "noticeably slower"),
 )
-PROFILE_LABELS = {name: label for name, label, _w, _rgb, _tip in PROFILES}
-PROFILE_BARS = {name: (width, rgb) for name, _label, width, rgb, _tip in PROFILES}
+PROFILE_LABELS = {name: label for name, label, _m, _rgb, _tip in PROFILES}
+PROFILE_MARKS = {name: (mark, rgb) for name, _label, mark, rgb, _tip in PROFILES}
 # Long enough to cover a polkit prompt if the sudoers rule isn't installed.
 PROFILE_POLL_MS = 200
 PROFILE_TIMEOUT_MS = 120_000
@@ -215,25 +239,24 @@ def format_duration(seconds):
 
 
 def panel_is_dark():
+    """Whether the bar is painting itself dark.
+
+    Asked of noctalia rather than of xfconf, which is the same question to a
+    different owner. The GTK theme is still not a reliable answer: the bar
+    picks its own palette and a GTK app under Wayland has no way to read it.
+    """
     try:
         out = subprocess.run(
-            ["xfconf-query", "-c", "xfce4-panel", "-p", "/panels/dark-mode"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (subprocess.CalledProcessError, OSError):
-        return False
-    return out == "true"
+            ["noctalia", "msg", "theme-mode-get"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip().lower()
+    except (subprocess.SubprocessError, OSError):
+        return True  # noctalia ships dark; guessing dark is the safer miss
+    return out == "dark"
 
 
 def default_fg_rgb():
-    """The colour the panel most likely paints its own text in.
-
-    In dark mode the panel uses its own dark variant regardless of the GTK
-    theme, so the theme's foreground can't be trusted; otherwise the panel
-    follows the theme and that foreground is the right match.
-    """
+    """The colour the bar most likely paints its own text in."""
     if panel_is_dark():
         return DARK_PANEL_RGB
     colour = Gtk.Label().get_style_context().get_color(Gtk.StateFlags.NORMAL)
@@ -257,16 +280,6 @@ class BatteryState:
         # "Unknown" on AC is how a battery held at its charge threshold often
         # reports; only treat a clear Discharging as running down.
         return self.status == "Discharging"
-
-    def colour(self, default_rgb):
-        if self.charging:
-            return CHARGING_RGB
-        if self.draining and self.percent is not None:
-            if self.percent <= CRITICAL_PERCENT:
-                return CRITICAL_RGB
-            if self.percent <= LOW_PERCENT:
-                return LOW_RGB
-        return default_rgb
 
     def describe(self):
         if self.percent is None:
@@ -294,99 +307,45 @@ class BatteryState:
         return "\n".join(lines)
 
 
-def draw_bolt(ctx, size):
-    """A lightning bolt in the reserved top-right corner. Outlined so it keeps
-    its shape against a light panel as well as a dark one."""
-    bolt = ((0.62, 0.00), (0.16, 0.56), (0.44, 0.56), (0.34, 1.00), (0.84, 0.40),
-            (0.54, 0.40))
-    span = size * BOLT_FRACTION
-    x0, y0 = size - span, 0.0
+def draw_marks(ctx, size, count, plus):
+    """`count` plus or minus marks in a row, centred in a `size` square.
 
-    ctx.new_path()
-    for index, (bx, by) in enumerate(bolt):
-        point = (x0 + bx * span, y0 + by * span)
-        ctx.line_to(*point) if index else ctx.move_to(*point)
-    ctx.close_path()
-
-    # Scale the outline off the bolt, not the icon: a width picked for the icon
-    # is a sixth of the bolt's own size and rounds it off into a blob.
-    ctx.set_source_rgba(0, 0, 0, 0.45)
-    ctx.set_line_width(max(0.7, span * 0.10))
-    ctx.set_line_join(cairo.LINE_JOIN_MITER)
-    ctx.stroke_preserve()
-    ctx.set_source_rgb(*CHARGING_RGB)
-    ctx.fill()
-
-
-def draw_profile_bar(ctx, size, profile):
-    """A bar along the bottom edge marking an active profile: teal for the
-    saving ones — half the icon's width for saver, near full for extreme —
-    and violet across the full width for performance.
-
-    Direction is the reason the two families differ by hue rather than by
-    length alone: a longer teal bar means slower, so a longer bar can't also
-    mean faster. Neither hue is one the digits use, so the bar never reads as
-    a charge state.
+    A plus is the minus with a second bar across it, so the two families share
+    a stroke weight exactly and the eye reads the difference as the extra bar
+    rather than as a change of size.
     """
-    width, rgb = PROFILE_BARS[profile]
-    span = width * size
-    height = max(1.5, size * 0.10)
-    ctx.set_source_rgb(*rgb)
-    ctx.rectangle((size - span) / 2, size - height - max(0.5, size * 0.02),
-                  span, height)
+    length = size * MARK_LENGTH_FRACTION
+    thick = max(2.0, size * MARK_THICKNESS_FRACTION)
+    gap = size * MARK_GAP_FRACTION
+
+    total = count * length + (count - 1) * gap
+    left = (size - total) / 2
+    middle = size / 2
+
+    for index in range(count):
+        centre = left + index * (length + gap) + length / 2
+        ctx.rectangle(centre - length / 2, middle - thick / 2, length, thick)
+        if plus:
+            ctx.rectangle(centre - thick / 2, middle - length / 2, thick, length)
     ctx.fill()
 
 
-def draw_text(ctx, text, box):
-    """Fit `text` to `box` (x, y, w, h) and draw it centred inside it."""
-    x, y, width, height = box
-    ctx.set_font_size(height)
-    extents = ctx.text_extents(text)
-    if not extents.width or not extents.height:
-        return
-    ctx.set_font_size(
-        height * min(width / extents.width, height / extents.height)
-    )
-    extents = ctx.text_extents(text)
-    # Centre on the ink extents rather than the font's line box: digits carry
-    # no ascender or descender, so the line box would sit them too high.
-    ctx.move_to(
-        x + (width - extents.width) / 2 - extents.x_bearing,
-        y + height - (height - extents.height) / 2 - (extents.height + extents.y_bearing),
-    )
-    ctx.show_text(text)
+def render_icon(size, default_rgb, profile=DEFAULT_PROFILE):
+    """The active power profile as a pixbuf, sized for the bar's icon slot.
 
-
-def render_icon(size, state, default_rgb, profile=DEFAULT_PROFILE):
-    """The percentage as a pixbuf sized for the tray's current icon slot.
-
-    The tray allocates a square (xfce4-panel squashes anything wider), so
-    neither marker can sit beside the digits — the bolt takes the top-right
-    corner while charging, the saver bar the bottom edge, and the digits give
-    up the height to keep clear of both rather than overlapping them into an
-    unreadable smudge.
+    Nothing else is drawn here. The charge state this used to carry lives in
+    the tooltip and in noctalia's own battery widget — see the module
+    docstring.
     """
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
     ctx = cairo.Context(surface)
-    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
 
-    text = "?" if state.percent is None else str(state.percent)
-    if state.charging:
-        top, height = (size * (1 - CHARGING_TEXT_FRACTION),
-                       size * CHARGING_TEXT_FRACTION)
-    else:
-        top, height = 0.0, size * TEXT_FRACTION
-    marked = profile != DEFAULT_PROFILE
-    if marked:
-        height -= size * MARKER_FRACTION
-
-    ctx.set_source_rgb(*state.colour(default_rgb))
-    draw_text(ctx, text, (0.0, top, size, height))
-
-    if state.charging:
-        draw_bolt(ctx, size)
-    if marked:
-        draw_profile_bar(ctx, size, profile)
+    mark, rgb = PROFILE_MARKS.get(profile, PROFILE_MARKS[DEFAULT_PROFILE])
+    ctx.set_source_rgb(*(rgb or default_rgb))
+    # The table spells the marker out — "++", "+", "-", "--" — because that is
+    # what it looks like on screen and what it is called everywhere else. The
+    # two things the drawing needs fall straight out of it.
+    draw_marks(ctx, size, len(mark), mark.startswith("+"))
 
     surface.flush()
     return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
@@ -397,7 +356,6 @@ class BatteryTray:
         self.device = find_battery()
         self.size = FALLBACK_ICON_SIZE
         self.default_rgb = default_fg_rgb()
-        self.menu = None
         self.profile = read_profile()
         self.auto = read_auto()
         self._switching = None
@@ -407,11 +365,10 @@ class BatteryTray:
         # the AC line can have moved while nothing was running to notice.
         self._on_ac = None
 
-        self.icon = Gtk.StatusIcon()
-        self.icon.set_title("Battery")
-        self.icon.connect("size-changed", self.on_size_changed)
-        self.icon.connect("activate", self.on_click)
-        self.icon.connect("popup-menu", self.on_popup_menu)
+        self.tray = tray.Tray(
+            "battery-tray", "battery-symbolic", "Battery",
+            category=tray.CATEGORY.HARDWARE,
+        )
         self.refresh()
         GLib.timeout_add(POLL_INTERVAL_MS, self.on_poll)
         # sysfs doesn't survive a reboot but the state file does, so at login
@@ -419,14 +376,6 @@ class BatteryTray:
         # the AC line, which may well have changed while this machine was off.
         self.reapply_profile()
         self.check_ac()
-
-    def on_size_changed(self, _icon, size):
-        # The panel hands out its icon size here, and again whenever the panel
-        # is resized; redraw at the new resolution instead of letting the tray
-        # scale a stale pixbuf.
-        self.size = max(FALLBACK_ICON_SIZE, size)
-        self.refresh()
-        return True
 
     def refresh(self):
         # Picked up from the files rather than held in memory, so a profile or
@@ -439,24 +388,50 @@ class BatteryTray:
             # machine; look again rather than staying blank forever.
             self.device = find_battery()
         if self.device is None:
-            self.icon.set_visible(False)
+            self.tray.set_visible(False)
             return
+        self.tray.set_visible(True)
 
         try:
             state = BatteryState(self.device)
         except READ_ERRORS:
             return
-        self.icon.set_from_pixbuf(
-            render_icon(self.size, state, self.default_rgb, self.profile)
-        )
+        # The icon depends on the profile and nothing else now, so it is redrawn
+        # when the profile changes and not once a poll. sni.set_icon_pixbuf
+        # would drop the duplicate anyway; this skips the cairo pass that
+        # produces it.
+        if self.profile != getattr(self, "_drawn_profile", None):
+            self._drawn_profile = self.profile
+            self.tray.set_pixbuf(
+                render_icon(self.size, self.default_rgb, self.profile)
+            )
+
         lines = [state.describe()]
         if self.profile != DEFAULT_PROFILE:
             # Say when the profile isn't yours, so a machine sitting in
             # performance nobody selected explains itself on hover.
             reason = " — automatic on AC" if ac_engaged() else ""
             lines.append(f"Power: {PROFILE_LABELS[self.profile]}{reason}")
-        self.icon.set_tooltip_text("\n".join(lines))
-        self.icon.set_visible(True)
+        self.tray.set_tooltip(" · ".join(lines))
+
+        # Rebuild the menu only when something in it actually changed.
+        #
+        # This used to run on every refresh, i.e. every POLL_INTERVAL_MS. A
+        # StatusNotifierItem menu is served over DBusMenu and every rebuild
+        # bumps its revision, so the host was being told the menu had changed
+        # five times a second-and-a-bit forever — 10,255 revisions by the time
+        # it was measured.
+        #
+        # That was worth stopping on its own, but it was not why clicking did
+        # nothing: noctalia never reads the menu at all, so there was nothing
+        # to interrupt. That turned out to be ItemIsMenu — see lib/sni.py.
+        #
+        # The tooltip still updates every poll, because it genuinely changes
+        # every poll.
+        menu_state = (self.profile, self.auto, self._switching is None)
+        if menu_state != getattr(self, "_menu_state", None):
+            self._menu_state = menu_state
+            self.tray.set_menu(self.build_menu())
 
     def check_ac(self):
         """Hand every plug and unplug to power-profile, which decides what it
@@ -508,7 +483,7 @@ class BatteryTray:
         menu.append(follow)
         menu.append(Gtk.SeparatorMenuItem())
 
-        settings = Gtk.MenuItem(label="Power Manager Settings")
+        settings = Gtk.MenuItem(label="noctalia Settings")
         settings.connect("activate", self.on_settings)
         menu.append(settings)
         menu.append(Gtk.SeparatorMenuItem())
@@ -517,7 +492,6 @@ class BatteryTray:
         quit_item.connect("activate", lambda _item: Gtk.main_quit())
         menu.append(quit_item)
 
-        menu.show_all()
         return menu
 
     def on_profile_toggled(self, item, name):
@@ -604,25 +578,13 @@ class BatteryTray:
 
     def on_settings(self, _item):
         try:
-            subprocess.Popen([SETTINGS_BIN])
+            subprocess.Popen(SETTINGS_ARGV)
         except OSError:
             pass
 
-    def show_menu(self, button, time):
-        # Rebuilt per click so it can't outlive the icon's position.
-        self.menu = self.build_menu()
-        self.menu.popup(None, None, Gtk.StatusIcon.position_menu, self.icon,
-                        button, time)
-
-    def on_click(self, _icon):
-        self.refresh()
-        self.show_menu(1, Gtk.get_current_event_time())
-
-    def on_popup_menu(self, _icon, button, time):
-        self.show_menu(button, time)
-
 
 def main():
+    GLib.set_prgname("battery-tray")
     if find_battery() is None:
         raise SystemExit("no system battery found under /sys/class/power_supply")
     BatteryTray()

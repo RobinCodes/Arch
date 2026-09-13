@@ -1,8 +1,23 @@
 #!/bin/bash
-# nightlight-auto [--print] — sets night light intensity based on time of day.
-# 19:00-07:00: held at PEAK.
-# 07:00-19:00: smooth curve dipping to NOON at solar noon (13:00), rising back
-#              to PEAK at the day/night boundaries (no jump).
+# nightlight-auto [--print] — sets night light intensity from the time of day.
+#
+# THE CURVE
+#
+#   16:00 → 19:00   rise   0% → 70%
+#   19:00 → 05:00   hold   70%          (across midnight)
+#   05:00 → 06:30   fall   70% → 0%
+#   06:30 → 16:00   hold   0%           (neutral; the screen is not tinted)
+#
+# Four times and one ceiling, all just below. Editing them is the supported way
+# to change the schedule — nothing else in this repo has a copy of the curve.
+#
+# The two ramps are eased rather than straight lines. The endpoints are exactly
+# the times above, so "0% at 06:30" and "70% at 19:00" hold literally; the
+# easing only decides the shape between them. A straight ramp has a corner at
+# each end, where the rate of change goes from nothing to its full value in one
+# tick, and a corner is the part the eye actually catches — the screen looks
+# still, then visibly starts moving. Smoothstep leaves and arrives at zero rate,
+# so the ramp has no moment you can point at.
 #
 # --print writes the intensity that should be on screen right now to stdout and
 # touches nothing else. It exists for callers that must not go through
@@ -10,13 +25,26 @@
 # account's config, so it asks for the number and applies it itself. That keeps
 # the curve below the only definition of the schedule.
 NIGHTLIGHT="$(cd "$(dirname "$0")" && pwd)/nightlight"
-CONF="$HOME/.config/redshift/redshift.conf"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nightlight"
-OVERRIDE="$STATE/override-until"
 MODE_FILE="$STATE/mode"
+KELVIN_FILE="$STATE/kelvin"
+LEGACY_CONF="$HOME/.config/redshift/redshift.conf"
 
-PEAK=100  # night-time intensity, as a % of nightlight's 0-100 scale (2500K)
-NOON=35   # daytime minimum, reached at 13:00
+# The ceiling the schedule ever reaches, as a % of nightlight's 0-100 scale.
+# 70 rather than 100: the bottom of that scale is 2500K, which is deep amber and
+# further than this screen wants to go. 70 lands at 3700K — still clearly warm
+# at night, without the colour cast that made the last 30% unusable.
+#
+# This caps the *schedule* only. `nightlight 100` by hand still goes all the way
+# and holds there until automatic mode is switched back on; the ceiling is what
+# the automation chooses, not a limit on what you can ask for.
+PEAK=70
+
+# Decimal hours. 6.5 is 06:30.
+RISE_START=16.0   # nothing before this: the day is neutral, not faintly warm
+RISE_END=19.0     # at PEAK by here
+FALL_START=5.0    # still at PEAK until here
+FALL_END=6.5      # back to 0 by here
 
 print_only=0
 if [ "$1" = "--print" ]; then
@@ -24,18 +52,21 @@ if [ "$1" = "--print" ]; then
     shift
 fi
 
-# The 30s-after-startup run can beat xfce4-session's import of the session
-# environment into systemd, leaving redshift with no X server to talk to.
-export DISPLAY="${DISPLAY:-:0}"
-export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+# The systemd user manager gets WAYLAND_DISPLAY and NIRI_SOCKET from niri's own
+# `systemctl --user import-environment` at session start, so there is nothing to
+# fake here the way the X11 version had to fake DISPLAY. If the variables are
+# genuinely absent the session is not up and gamma-apply will say so rather than
+# half-work.
 
 # The intensity already on record, for --print in the cases where the schedule
 # is not the one deciding. Falls back to the argument — the scheduled value —
-# when the config is missing or unreadable, which beats guessing: a login screen
+# when the state is missing or unreadable, which beats guessing: a login screen
 # at midday should not go night-warm just because a file went missing.
 current_pct() {
     local temp
-    temp=$(grep -oP '(?<=^temp-day=)\d+' "$CONF" 2>/dev/null)
+    temp=$(cat "$KELVIN_FILE" 2>/dev/null)
+    [[ "$temp" =~ ^[0-9]+$ ]] || \
+        temp=$(grep -oP '(?<=^temp-day=)\d+' "$LEGACY_CONF" 2>/dev/null)
     if [[ "$temp" =~ ^[0-9]+$ ]]; then
         echo $(( (6500 - temp) / 40 ))
     else
@@ -45,19 +76,29 @@ current_pct() {
 
 now=$(date +%H:%M)
 
-sched=$(awk -v now="$now" -v peak="$PEAK" -v noon="$NOON" 'BEGIN {
+sched=$(awk -v now="$now" -v peak="$PEAK" \
+            -v rs="$RISE_START" -v re="$RISE_END" \
+            -v fs="$FALL_START" -v fe="$FALL_END" 'BEGIN {
     split(now, a, ":")
     t = a[1] + a[2] / 60
-    pi = 3.14159265358979
-    if (t >= 19 || t < 7) { print peak; exit }
-    frac = (t - 7) / 12
-    val = noon + (peak - noon) * (1 - sin(pi * frac))
-    printf "%d\n", val + 0.5
+
+    if (t >= rs && t < re) {                  # evening rise
+        u = (t - rs) / (re - rs)
+        v = peak * (u * u * (3 - 2 * u))
+    } else if (t >= fs && t < fe) {           # dawn fall
+        u = (t - fs) / (fe - fs)
+        v = peak * (1 - u * u * (3 - 2 * u))
+    } else if (t >= re || t < fs) {           # night, across midnight
+        v = peak
+    } else {                                  # daytime, fe..rs
+        v = 0
+    }
+    printf "%d\n", v + 0.5
 }')
 
-# Manual mode: the intensity is whatever the user last set, indefinitely.
-# Only the literal string "manual" counts, so a missing or corrupt state file
-# leaves the schedule running rather than silently disabling it.
+# Manual mode: the intensity is whatever was last set, indefinitely. Only the
+# literal string "manual" counts, so a missing or corrupt state file leaves the
+# schedule running rather than silently disabling it.
 if [ "$(cat "$MODE_FILE" 2>/dev/null || true)" = manual ]; then
     if [ "$print_only" -eq 1 ]; then
         current_pct "$sched"
@@ -65,26 +106,6 @@ if [ "$(cat "$MODE_FILE" 2>/dev/null || true)" = manual ]; then
         echo "auto: ${now} -> skipped (manual mode)"
     fi
     exit 0
-fi
-
-# Someone moved the slider by hand; leave their value alone until the next
-# day/night boundary, then take the schedule back over.
-if [ -f "$OVERRIDE" ]; then
-    until=$(cat "$OVERRIDE" 2>/dev/null || true)
-    # Anything not a live timestamp (empty, truncated, stale) just falls
-    # through and hands the schedule back.
-    if [[ "$until" =~ ^[0-9]+$ ]] && [ "$(date +%s)" -lt "$until" ]; then
-        if [ "$print_only" -eq 1 ]; then
-            current_pct "$sched"
-        else
-            echo "auto: ${now} -> held by manual override until $(date -d "@$until" '+%H:%M')"
-        fi
-        exit 0
-    fi
-    # Only expire the hold when actually driving the screen. --print is a
-    # question, not a turn of the schedule, and root asking it at the login
-    # screen must not spend the override the session is about to want.
-    [ "$print_only" -eq 1 ] || rm -f "$OVERRIDE"
 fi
 
 if [ "$print_only" -eq 1 ]; then

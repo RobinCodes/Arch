@@ -1,28 +1,67 @@
 #!/bin/bash
-# nightlight [--auto] [0-100]   — get or set the night light intensity.
-# nightlight --mode [auto|manual] — get or set how nightlight-auto behaves.
+# nightlight [--auto] [0-100]     — get or set the night light intensity.
+# nightlight --mode [auto|manual] — get or set whether the schedule runs.
+# nightlight --print              — the current intensity, bare, for scripts.
 #
 # 0 = off (6500K, neutral), 100 = strongest (2500K, very warm).
 #
-# Two modes:
-#   auto    nightlight-auto drives the intensity from the time of day. Setting
-#           a value by hand parks an override until the next 07:00/19:00
-#           boundary, then the schedule takes back over.
-#   manual  nightlight-auto does nothing; whatever you set stays put.
+# TWO MODES, AND SETTING A VALUE PICKS ONE
 #
-# --auto is how nightlight-auto sets the value without arming an override.
-# --mode only writes the setting; run nightlight-auto to apply it right away.
+#   auto    nightlight-auto drives the intensity from the time of day.
+#   manual  the schedule does not run; whatever you set stays put.
+#
+# Setting a value by hand switches to manual. That is the whole of the override
+# mechanism now, and it replaces an earlier one that parked a hold until the
+# next schedule boundary and then handed control back on its own.
+#
+# The hold went because it answered a question nobody was asking. A slider is
+# moved because the schedule's idea of the right colour is wrong for what is on
+# screen — and that reason does not expire at 19:00. What the hold actually did
+# was put the value back some hours later, usually unnoticed, which is the one
+# behaviour a manual override exists to prevent. Switching to manual is both
+# simpler to explain and what the control was for: it stays where you put it
+# until you turn the schedule back on.
+#
+# --auto is how nightlight-auto sets the value without switching modes, and is
+# the only caller that should use it.
+#
+# WHERE THE STATE LIVES
+#
+# All of it in $STATE: `kelvin` is the current temperature, `mode` is auto or
+# manual. Applying a temperature goes through ./gamma-apply, which owns the
+# question of what is holding the ramp — on Wayland something has to stay alive
+# to hold it, see that file's header, where on X11 redshift could set it and
+# exit. `kelvin` used to live in redshift.conf; that file is still read once as
+# a fallback, so an existing install carries its value across instead of
+# snapping to neutral.
 set -e
-CONF="$HOME/.config/redshift/redshift.conf"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/nightlight"
-OVERRIDE="$STATE/override-until"
 MODE_FILE="$STATE/mode"
+KELVIN_FILE="$STATE/kelvin"
+LEGACY_CONF="$HOME/.config/redshift/redshift.conf"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+GAMMA_APPLY="$HERE/gamma-apply"
+
+NEUTRAL=6500
+PER_PERCENT=40
 
 current_temp() {
-    grep -oP '(?<=^temp-day=)\d+' "$CONF"
+    local temp
+    temp=$(cat "$KELVIN_FILE" 2>/dev/null)
+    if [[ "$temp" =~ ^[0-9]+$ ]]; then
+        echo "$temp"
+        return
+    fi
+    # One-time migration from the redshift.conf era.
+    temp=$(grep -oP '(?<=^temp-day=)\d+' "$LEGACY_CONF" 2>/dev/null)
+    if [[ "$temp" =~ ^[0-9]+$ ]]; then
+        echo "$temp"
+        return
+    fi
+    echo "$NEUTRAL"
 }
 
-# Anything unset or unrecognised means auto, so a missing//corrupt state file
+# Anything unset or unrecognised means auto, so a missing or corrupt state file
 # fails back to the scheduled behaviour rather than freezing the screen.
 current_mode() {
     local m
@@ -33,21 +72,12 @@ current_mode() {
     esac
 }
 
-# Epoch of the next day/night transition, matching nightlight-auto's 07:00 and
-# 19:00 edges.
-next_boundary() {
-    local h
-    h=$(date +%-H)
-    if [ "$h" -lt 7 ]; then
-        date -d 'today 07:00' +%s
-    elif [ "$h" -lt 19 ]; then
-        date -d 'today 19:00' +%s
-    else
-        date -d 'tomorrow 07:00' +%s
-    fi
+set_mode() {
+    mkdir -p "$STATE"
+    printf '%s\n' "$1" > "$MODE_FILE"
 }
 
-if [ "$1" = "--mode" ]; then
+if [ "${1:-}" = "--mode" ]; then
     shift
     if [ $# -eq 0 ]; then
         current_mode
@@ -57,23 +87,38 @@ if [ "$1" = "--mode" ]; then
         auto|manual) ;;
         *) echo "usage: nightlight --mode [auto|manual]" >&2; exit 1 ;;
     esac
-    mkdir -p "$STATE"
-    printf '%s\n' "$1" > "$MODE_FILE"
-    # Either direction makes a pending hold meaningless.
-    rm -f "$OVERRIDE"
+    set_mode "$1"
     echo "night light mode: $1"
+    # Switching to auto applies the scheduled value straight away rather than
+    # leaving the screen on the manual one until the next five-minute tick.
+    # Turning a schedule back on and watching nothing happen reads as a broken
+    # switch. The other direction needs nothing: manual means "keep what is on
+    # screen", and it already is.
+    #
+    # Spelled as an `if` rather than `[ x ] && cmd` because this runs under
+    # `set -e`, where that one-liner exits 1 on the manual branch — the test
+    # fails, the list returns its status, and the script dies right after
+    # reporting success.
+    if [ "$1" = auto ]; then
+        "$HERE/nightlight-auto" >/dev/null
+    fi
+    exit 0
+fi
+
+if [ "${1:-}" = "--print" ]; then
+    echo $(( (NEUTRAL - $(current_temp)) / PER_PERCENT ))
     exit 0
 fi
 
 auto=0
-if [ "$1" = "--auto" ]; then
+if [ "${1:-}" = "--auto" ]; then
     auto=1
     shift
 fi
 
 if [ $# -eq 0 ]; then
     temp=$(current_temp)
-    pct=$(( (6500 - temp) / 40 ))
+    pct=$(( (NEUTRAL - temp) / PER_PERCENT ))
     echo "current intensity: ${pct}% ($(current_mode), ${temp}K)"
     exit 0
 fi
@@ -84,17 +129,22 @@ if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -gt 100 ]; then
     exit 1
 fi
 
-temp=$((6500 - pct * 40))
-sed -i "s/^temp-day=.*/temp-day=$temp/; s/^temp-night=.*/temp-night=$temp/" "$CONF"
-# -P resets the existing gamma ramp first; without it redshift stacks each
-# adjustment on top of the last and the screen creeps redder on every call.
-redshift -P -O "$temp" >/dev/null
+temp=$((NEUTRAL - pct * PER_PERCENT))
 
-# Only worth arming an override when there is a schedule to hold off.
-if [ "$auto" -eq 0 ] && [ "$(current_mode)" = auto ]; then
-    mkdir -p "$STATE"
-    next_boundary > "$OVERRIDE"
-    echo "night light set to ${pct}% (${temp}K), holding until $(date -d "@$(cat "$OVERRIDE")" '+%H:%M')"
+# The value is recorded only once the screen has actually taken it. Writing
+# first would leave the state claiming a temperature that never landed — which,
+# with no gamma backend installed, is the difference between a clear error and a
+# tray that lies about what you are looking at.
+"$GAMMA_APPLY" "$temp"
+mkdir -p "$STATE"
+printf '%s\n' "$temp" > "$KELVIN_FILE"
+
+if [ "$auto" -eq 0 ]; then
+    # A hand-set value is a manual one. Written after the temperature landed,
+    # for the same reason: a failed apply should not leave the schedule
+    # switched off as a souvenir.
+    set_mode manual
+    echo "night light set to ${pct}% (${temp}K), schedule off until you turn it back on"
 else
     echo "night light set to ${pct}% (${temp}K)"
 fi

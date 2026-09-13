@@ -1,14 +1,25 @@
 #!/bin/bash
 # zen — strip the desktop down to one app (or a few) and freeze the screen.
 #
-# Zen deliberately stays inside the running X session. The night light is a
-# one-shot gamma ramp pushed into this X server (../nightlight/nightlight calls
-# `redshift -P -O`), and gamma ramps are per-X-server state: a kiosk session on
-# a second VT, or restarting xfce4-session, would drop the ramp and snap the
-# screen back to a cold 6500K the moment zen started. So zen tears down the
-# *visible* layer and stops the *automation*, and never touches the display
-# pipeline itself. Whatever warmth and brightness are on screen when you enter
-# are exactly what stays until you leave.
+# Zen deliberately stays inside the running compositor session, and the reason
+# survived the move to Wayland intact — it got stronger, if anything. The night
+# light is a gamma ramp held by a live client through wlr-gamma-control (see
+# ../nightlight/gamma-apply), and the compositor takes that ramp back the
+# instant the client goes away. A kiosk session on another VT, or restarting
+# niri, would drop it and snap the screen to a cold 6500K the moment zen
+# started. On X11 the same conclusion came from the ramp being per-X-server
+# state; here it is per-connection, which is a shorter fuse for the same
+# mistake. So zen tears down the *visible* layer and stops the *automation*,
+# and never touches the display pipeline itself. Whatever warmth and
+# brightness are on screen when you enter are exactly what stays until you
+# leave.
+#
+# The desktop it strips is noctalia, and it is asked rather than killed: the
+# shell has an IPC with hide/show for the bar, the dock and the desktop
+# widgets, so zen no longer has to quit a panel and restart it afterwards. That
+# was always the ugliest part of the XFCE version — the tray plugins came back
+# in a different order, and anything that had crashed in the meantime came back
+# not at all. Hiding is reversible in a way that quitting never was.
 #
 #   zen NAME...     enter zen. Each NAME is a set from apps.conf or any
 #                   command; give more than one for multi-app zen:
@@ -38,12 +49,96 @@ SESSION="$STATE/session"
 LOG="$STATE/zen.log"
 
 UNSET="__unset__"
-# A WM_CLASS of its own is how the exit button stays out of the fullscreen
+# An app id of its own is how the exit button stays out of the fullscreen
 # watcher's way; without it the button is just another new top-level window and
-# gets stretched over the app it is meant to sit on top of.
-BUTTON_CLASS="ZenExitButton"
+# gets stretched over the app it is meant to sit on top of. Must match APP_ID
+# in zen-button.py, which is also what the window rule below matches on.
+BUTTON_CLASS="zen-exit-button"
+
+# Where the exit button's placement lives. A Wayland client cannot position its
+# own window — there is no protocol for it — so the corner the X11 build asked
+# for with a gtk move() is now a compositor rule. It is written to its own file
+# and pulled in with an include, for the same reason monitor/niri-output.py
+# does: config.kdl is hand-maintained and this has no business reformatting it.
+NIRI_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/niri"
+ZEN_KDL="$NIRI_DIR/zen.kdl"
+NIRI_CONF="$NIRI_DIR/config.kdl"
+
+# shellcheck source=../lib/niri.sh
+. "$ZEN_DIR/../lib/niri.sh"
+
+# Which desktop zen is stripping. zen still works when this is `unknown` — it
+# just has less to hide; the window half goes through zen-wm.py either way.
+BACKEND=$(session_kind)
 
 mkdir -p "$STATE"
+
+# ------------------------------------------------------------ niri rules ----
+
+# Keep the exit button's window rule current — but never add it.
+#
+# This used to install itself on every enter, on the reasoning that the rule is
+# useless without zen and zen is useless without the rule. That was wrong in one
+# direction: it meant a config edited to remove zen grew the include back the
+# next time zen ran, which is a script overruling a decision the user made about
+# their own config.
+#
+# So the include is now the opt-in switch. If config.kdl already includes
+# zen.kdl, this refreshes it; if it does not, this does nothing at all. Adding
+# it is an explicit act:
+#
+#     zen --install-niri-rules
+#
+# Without the rule the exit button still appears, it just gets tiled like any
+# other window instead of sitting in the corner. <Super>Z still leaves zen.
+ensure_window_rules() {
+    local force=${1:-0}
+    [ -n "${NIRI_SOCKET:-}" ] || return 0
+    [ -d "$NIRI_DIR" ] || return 0
+    if [ "$force" != 1 ] \
+       && ! grep -qE '^[[:space:]]*include[[:space:]]+"[^"]*zen\.kdl"' "$NIRI_CONF" 2>/dev/null; then
+        return 0
+    fi
+
+    local desired
+    desired=$(cat <<EOF
+// Managed by Scripts/Arch/zen/zen — rewritten whenever zen starts.
+//
+// The exit button is a floating window pinned to the bottom-right corner,
+// with every decoration off so it reads as a tab rather than a window. It is
+// opened unfocused on purpose: it appears while the app you asked for is
+// still mapping, and stealing focus at that moment would put your first
+// keystrokes into a button.
+window-rule {
+    match app-id=r#"^${BUTTON_CLASS}\$"#
+    open-floating true
+    default-floating-position x=12 y=12 relative-to="bottom-right"
+    default-column-width { fixed 92; }
+    default-window-height { fixed 30; }
+    open-focused false
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
+EOF
+)
+    # Only write when it would change, so niri's config watcher is not woken
+    # on every zen enter for nothing.
+    if [ ! -f "$ZEN_KDL" ] || [ "$(cat "$ZEN_KDL" 2>/dev/null)" != "$desired" ]; then
+        printf '%s\n' "$desired" > "$ZEN_KDL.tmp" && mv "$ZEN_KDL.tmp" "$ZEN_KDL"
+    fi
+
+    # The include, once, and only when explicitly asked for. Matched loosely so
+    # a line the user added themselves is not duplicated.
+    if [ "$force" = 1 ] \
+       && ! grep -qE '^[[:space:]]*include[[:space:]]+"[^"]*zen\.kdl"' "$NIRI_CONF" 2>/dev/null; then
+        {
+            printf '\n// Window rules for Scripts/Arch/zen.\n'
+            printf 'include "zen.kdl"\n'
+        } >> "$NIRI_CONF"
+        niri msg action load-config-file >/dev/null 2>&1 || true
+    fi
+}
 
 # ---------------------------------------------------------------- state ----
 # Everything zen changes is recorded here before it is changed, so --exit
@@ -54,7 +149,14 @@ mkdir -p "$STATE"
 save() { printf '%s=%s\n' "$1" "$2" >> "$SESSION"; }
 load() { grep -m1 "^$1=" "$SESSION" 2>/dev/null | cut -d= -f2- || true; }
 
-# ---------------------------------------------------------------- xfconf ----
+# -------------------------------------------------------------- noctalia ----
+# Every desktop-facing thing zen changes goes through the shell's own IPC.
+# Nothing here is fatal if noctalia is not running: zen is still useful on a
+# bare niri session, it just has less to hide.
+
+# --- xfconf, for the X11 strip ---------------------------------------------
+# A property zen created itself is reset rather than set false on the way out,
+# so zen leaves behind no settings that were not there before.
 
 xfconf_get() {
     xfconf-query -c "$1" -p "$2" 2>/dev/null || printf '%s\n' "$UNSET"
@@ -68,14 +170,45 @@ xfconf_set_bool() {
     fi
 }
 
-# A property zen created itself is reset rather than set false, so zen leaves
-# no settings behind that were not there before.
 xfconf_restore() {
     if [ "$3" = "$UNSET" ]; then
         xfconf-query -c "$1" -p "$2" -r 2>/dev/null || true
     else
         xfconf-query -c "$1" -p "$2" -s "$3" 2>/dev/null || true
     fi
+}
+
+# --- noctalia --------------------------------------------------------------
+
+NOCTALIA=noctalia
+
+have_noctalia() {
+    command -v "$NOCTALIA" >/dev/null 2>&1 && "$NOCTALIA" msg status >/dev/null 2>&1
+}
+
+noctalia_msg() {
+    "$NOCTALIA" msg "$@" 2>/dev/null || true
+}
+
+# Do-not-disturb, read back as the literal on/off the IPC prints. $UNSET when
+# the shell is not answering, which `zen --exit` treats as "leave it alone"
+# rather than guessing a value to restore.
+dnd_get() {
+    local value
+    value=$("$NOCTALIA" msg notification-dnd-status 2>/dev/null) || {
+        printf '%s\n' "$UNSET"; return; }
+    case "$value" in
+        on|off) printf '%s\n' "$value" ;;
+        *)      printf '%s\n' "$UNSET" ;;
+    esac
+}
+
+dnd_set() {
+    noctalia_msg notification-dnd-set "$1"
+}
+
+dnd_restore() {
+    [ "$1" = "$UNSET" ] || dnd_set "$1"
 }
 
 # ----------------------------------------------------------------- procs ----
@@ -175,21 +308,12 @@ set_names() {
         }' "$CONF" 2>/dev/null
 }
 
-screen_size() {
-    xrandr --query 2>/dev/null | awk '
-        / connected/ {
-            if (match($0, /[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/)) {
-                split(substr($0, RSTART, RLENGTH), a, /[x+]/)
-                print a[1], a[2]
-                exit
-            }
-        }'
-}
-
 # ------------------------------------------------------------------ enter ----
 
 do_enter() {
     local -a apps=("$@")
+
+    ensure_window_rules
 
     if [ -f "$SESSION" ]; then
         echo "zen: already active (started $(load started)). Run 'zen --exit' first." >&2
@@ -228,10 +352,20 @@ do_enter() {
         else
             echo "  (none)"
         fi
-        echo "zen: would stop: xfce4-panel, xfdesktop, notifications,"
-        echo "                 nightlight-auto.timer, screensaver/DPMS, tumblerd"
-        echo "zen: would NOT touch: xfsettingsd, xfwm4, pipewire, dbus, polkit,"
-        echo "                      redshift/gamma, backlight, system services"
+        if [ "$BACKEND" = x11 ]; then
+            echo "zen: would quit: xfce4-panel, xfdesktop"
+            echo "zen: would set:  do-not-disturb, presentation mode, 1 workspace"
+            echo "zen: would stop: nightlight-auto.timer, tumblerd"
+            echo "zen: would NOT touch: xfsettingsd, xfwm4, pipewire, dbus,"
+            echo "                      polkit, the gamma ramp, backlight, services"
+        else
+            echo "zen: would hide: noctalia's bar, dock and desktop widgets,"
+            echo "                 and put notifications in do-not-disturb"
+            echo "zen: would stop: nightlight-auto.timer, tumblerd"
+            echo "zen: would hold: an idle inhibit, so nothing blanks or sleeps"
+            echo "zen: would NOT touch: niri, noctalia itself, pipewire, dbus,"
+            echo "                      polkit, the gamma ramp, backlight, services"
+        fi
         exit 0
     fi
 
@@ -277,34 +411,85 @@ do_enter() {
         echo "zen: night light automation paused (current warmth held)"
     fi
 
-    # Presentation mode is XFCE's own inhibit for idle-dim, blank and DPMS. It
-    # is used instead of `xset s off -dpms` because xorg-xset is not installed,
-    # and it avoids touching brightness at all.
-    save presentation "$(xfconf_get xfce4-power-manager /xfce4-power-manager/presentation-mode)"
-    xfconf_set_bool xfce4-power-manager /xfce4-power-manager/presentation-mode true
+    # noctalia calls its idle inhibitor "caffeine", and it is the direct
+    # replacement for XFCE's presentation mode: it stops the blank and the
+    # sleep without going anywhere near brightness. Unlike presentation mode it
+    # is runtime state rather than a settings key, so there is no created-vs-
+    # existing property to unpick on the way out — it is simply turned back off.
+    if [ "$BACKEND" = x11 ]; then
+        # XFCE's own inhibit for idle-dim, blank and DPMS. Used instead of
+        # `xset s off -dpms` because xorg-xset is not installed, and it avoids
+        # touching brightness at all.
+        save presentation "$(xfconf_get xfce4-power-manager /xfce4-power-manager/presentation-mode)"
+        xfconf_set_bool xfce4-power-manager /xfce4-power-manager/presentation-mode true
+    elif have_noctalia; then
+        noctalia_msg caffeine-enable
+        save caffeine 1
+    fi
 
-    # Belt and braces: the screensaver has its own inhibit path, and the
-    # command holds the inhibit for as long as it stays alive.
-    if command -v xfce4-screensaver-command >/dev/null 2>&1; then
-        spawn_tracked inhibit xfce4-screensaver-command --inhibit \
-            --application-name zen --reason "zen mode"
+    # Belt and braces, and the half that works with no shell at all:
+    # systemd-inhibit holds a logind lock for as long as the process lives, so
+    # a zen that dies takes the inhibit with it rather than leaving the machine
+    # permanently unable to sleep. `sleep infinity` is the whole payload.
+    if command -v systemd-inhibit >/dev/null 2>&1; then
+        spawn_tracked inhibit systemd-inhibit \
+            --what=idle:sleep:handle-lid-switch \
+            --who=zen --why="zen mode" --mode=block \
+            sleep infinity
     fi
 
     # --- strip the desktop ------------------------------------------------
-    save notifyd_dnd "$(xfconf_get xfce4-notifyd /do-not-disturb)"
-    xfconf_set_bool xfce4-notifyd /do-not-disturb true
-
-    if pgrep -u "$USER" -x xfce4-panel >/dev/null 2>&1; then
-        # Takes every tray plugin with it: clipman, nm-applet, blueman, and the
-        # brightness tray. The brightness tray's 2s poll is read-only, so losing
-        # it changes nothing on screen.
-        xfce4-panel --quit >/dev/null 2>&1 || true
-        save panel 1
+    if [ "$BACKEND" = x11 ]; then
+        save notifyd_dnd "$(xfconf_get xfce4-notifyd /do-not-disturb)"
+        xfconf_set_bool xfce4-notifyd /do-not-disturb true
+    else
+        save notifyd_dnd "$(dnd_get)"
+        dnd_set on
     fi
 
-    if pgrep -u "$USER" -x xfdesktop >/dev/null 2>&1; then
-        xfdesktop --quit >/dev/null 2>&1 || true
-        save xfdesktop 1
+    # Hidden, not quit. The bar keeps running, so every tray icon it is hosting
+    # — blueman, nm-applet, and this repo's own four — is still there when it
+    # comes back, in the order it was in. The XFCE version had to quit
+    # xfce4-panel outright and take all of them down with it.
+    if [ "$BACKEND" = x11 ]; then
+        # Quit, not hide: xfce4-panel has no hide command, which is the whole
+        # reason the noctalia path below is an improvement rather than a
+        # translation. Quitting takes every tray plugin with it — clipman,
+        # nm-applet, blueman, and this repo's own four — and they come back in
+        # whatever order the panel restores them in.
+        if pgrep -u "$USER" -x xfce4-panel >/dev/null 2>&1; then
+            xfce4-panel --quit >/dev/null 2>&1 || true
+            save panel 1
+        fi
+        if pgrep -u "$USER" -x xfdesktop >/dev/null 2>&1; then
+            xfdesktop --quit >/dev/null 2>&1 || true
+            save xfdesktop 1
+        fi
+        # One workspace for the duration, so there is nowhere to wander off to.
+        # niri has no equivalent — its workspaces are dynamic with no count to
+        # clamp — so this is X11-only rather than something the port dropped.
+        local ws
+        ws=$(xfconf-query -c xfwm4 -p /general/workspace_count 2>/dev/null || echo "$UNSET")
+        if [ "$ws" != "$UNSET" ] && [ "$ws" != 1 ]; then
+            save workspaces "$ws"
+            xfconf-query -c xfwm4 -p /general/workspace_count -s 1 2>/dev/null || true
+        fi
+    elif have_noctalia; then
+        noctalia_msg bar-hide
+        save bar 1
+
+        noctalia_msg dock-hide
+        save dock 1
+
+        # The nearest thing niri has to xfdesktop: noctalia's desktop widgets.
+        # Runtime-only, so this does not persist into the saved settings.
+        noctalia_msg desktop-widgets-hide
+        save widgets 1
+
+        # On-screen volume/brightness popups. Not something the XFCE version
+        # could turn off, and exactly the kind of thing zen exists to remove.
+        noctalia_msg osd-disable
+        save osd 1
     fi
 
     if systemctl --user is-active --quiet tumblerd.service; then
@@ -312,13 +497,13 @@ do_enter() {
         save tumblerd 1
     fi
 
-    # One workspace for the duration, so there is nowhere to wander off to.
-    local ws
-    ws=$(xfconf-query -c xfwm4 -p /general/workspace_count 2>/dev/null || echo "$UNSET")
-    if [ "$ws" != "$UNSET" ] && [ "$ws" != 1 ]; then
-        save workspaces "$ws"
-        xfconf-query -c xfwm4 -p /general/workspace_count -s 1 2>/dev/null || true
-    fi
+    # No workspace pinning any more. xfwm4 had a fixed workspace count that
+    # could be set to 1, so there was literally nowhere to wander off to. niri
+    # creates and destroys workspaces on demand and has no count to clamp —
+    # there is no knob here to turn, and faking one by intercepting the
+    # workspace binds would mean rewriting the user's keymap on the way in and
+    # putting it back on the way out, which is a much bigger promise than zen
+    # should be making about a config file it does not own.
 
     # --- close everything -------------------------------------------------
     local survivors
@@ -420,13 +605,16 @@ do_exit() {
     # Read the whole session up front. The panel and desktop are restarted in
     # the background, and a backgrounded `load` could otherwise run after the
     # session file is deleted below, silently leaving the desktop with no panel.
-    local btn fs inh ws tumbler desktop panel dnd presentation nightlight
+    local btn fs inh tumbler widgets bar dock osd dnd caffeine nightlight
+    local ws desktop panel presentation
     btn=$(load button_pid);      fs=$(load fullscreen_pid)
-    inh=$(load inhibit_pid);     ws=$(load workspaces)
-    tumbler=$(load tumblerd);    desktop=$(load xfdesktop)
-    panel=$(load panel);         dnd=$(load notifyd_dnd)
-    presentation=$(load presentation)
+    inh=$(load inhibit_pid);     tumbler=$(load tumblerd)
+    widgets=$(load widgets);     bar=$(load bar)
+    dock=$(load dock);           osd=$(load osd)
+    dnd=$(load notifyd_dnd);     caffeine=$(load caffeine)
     nightlight=$(load nightlight_timer)
+    ws=$(load workspaces);       desktop=$(load xfdesktop)
+    panel=$(load panel);         presentation=$(load presentation)
 
     kill_unless_self "$btn"
     kill_unless_self "$fs"
@@ -436,15 +624,30 @@ do_exit() {
     # just spent an hour in would be a rude way to end a focus session.
     "$WM" unfullscreen-all >/dev/null 2>&1 || true
 
-    [ -n "$ws" ] && xfconf-query -c xfwm4 -p /general/workspace_count -s "$ws" 2>/dev/null
-
     [ "$tumbler" = 1 ] && systemctl --user start tumblerd.service 2>/dev/null
 
+    # Shown rather than relaunched, which is why none of these need a delay or
+    # a race against a starting process the way restarting xfce4-panel did.
+    [ "$widgets" = 1 ] && noctalia_msg desktop-widgets-show
+    [ "$dock" = 1 ]    && noctalia_msg dock-show
+    [ "$bar" = 1 ]     && noctalia_msg bar-show
+    [ "$osd" = 1 ]     && noctalia_msg osd-enable
+    [ "$caffeine" = 1 ] && noctalia_msg caffeine-disable
+
+    # The X11 side. Guarded on what was actually saved rather than on the
+    # current backend, so a zen entered under one session and exited after a
+    # crash still puts back exactly what it took.
+    [ -n "$ws" ] && xfconf-query -c xfwm4 -p /general/workspace_count -s "$ws" 2>/dev/null
     [ "$desktop" = 1 ] && { setsid xfdesktop >/dev/null 2>&1 </dev/null & }
     [ "$panel" = 1 ] && { setsid xfce4-panel >/dev/null 2>&1 </dev/null & }
+    [ -n "$presentation" ] && xfconf_restore xfce4-power-manager \
+        /xfce4-power-manager/presentation-mode "$presentation"
 
-    xfconf_restore xfce4-notifyd /do-not-disturb "$dnd"
-    xfconf_restore xfce4-power-manager /xfce4-power-manager/presentation-mode "$presentation"
+    if [ "$BACKEND" = x11 ]; then
+        xfconf_restore xfce4-notifyd /do-not-disturb "$dnd"
+    else
+        dnd_restore "$dnd"
+    fi
 
     if [ "$nightlight" = 1 ]; then
         systemctl --user start nightlight-auto.timer 2>/dev/null
@@ -469,12 +672,16 @@ do_status() {
     echo "zen: active since $(load started)"
     echo "changed:"
     [ "$(load nightlight_timer)" = 1 ] && echo "  night light automation stopped (warmth frozen)"
+    [ "$(load bar)" = 1 ]              && echo "  noctalia bar hidden"
+    [ "$(load dock)" = 1 ]             && echo "  noctalia dock hidden"
+    [ "$(load widgets)" = 1 ]          && echo "  desktop widgets hidden"
+    [ "$(load osd)" = 1 ]              && echo "  on-screen popups disabled"
     [ "$(load panel)" = 1 ]            && echo "  xfce4-panel quit"
     [ "$(load xfdesktop)" = 1 ]        && echo "  xfdesktop quit"
-    [ "$(load tumblerd)" = 1 ]         && echo "  tumblerd stopped"
     [ -n "$(load workspaces)" ]        && echo "  workspaces $(load workspaces) -> 1"
+    [ "$(load tumblerd)" = 1 ]         && echo "  tumblerd stopped"
     echo "  notifications: do-not-disturb"
-    echo "  screensaver/DPMS inhibited"
+    echo "  idle/sleep inhibited"
     exit 0
 }
 
@@ -494,6 +701,11 @@ while [ $# -gt 0 ]; do
         --pick|-p)      do_pick; exit 0 ;;
         --apps)         "$APPS_LIST"; exit $? ;;
         --button-watch) do_button_watch; exit 0 ;;
+        --install-niri-rules)
+            ensure_window_rules 1
+            echo "zen: niri window rule installed and included from config.kdl"
+            exit 0
+            ;;
         --dry-run|-n)   export ZEN_DRY_RUN=1 ;;
         --yes|-y)       export ZEN_YES=1 ;;
         -h|--help)      usage; exit 0 ;;

@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""artwork — choose where the wallpaper and the boot splash get their pictures.
+
+    artwork                    what is set now
+    artwork <folder>           use the images in that folder
+    artwork none               noctalia's own default wallpaper, black boot
+    artwork pick               a folder chooser, for when typing a path is worse
+    artwork refresh            re-render the boot splash after adding images
+
+ONE CHOICE, TWO CONSUMERS
+
+The wallpaper and the boot splash want the same pictures and take them in
+completely different ways, so this owns the choice and hands it to each in the
+form it needs:
+
+  wallpaper    noctalia already does folders, rotation and transitions. It is
+               pointed straight at yours — not at a copy — so adding a file to
+               the folder is the whole of adding a wallpaper, and nothing here
+               has to watch anything.
+
+  boot splash  plymouth reads its images out of the initramfs, which is built
+               once and then frozen, so this cannot point at anything. The
+               pictures are rendered to 1366x768 PNG8 and baked in by
+               install-plymouth.sh, which is why that half needs root and a
+               rebuild and the wallpaper half is instant.
+
+`none` is not "no wallpaper". It hands the desktop back to noctalia's default
+and makes the boot splash plain black, which is what a boot with nothing to say
+should look like.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "artwork")
+SOURCE_FILE = os.path.join(STATE_DIR, "source")
+SPLASH_DIR = os.path.join(STATE_DIR, "splash")
+
+NOCTALIA_SETTINGS = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "noctalia", "settings.toml")
+
+# noctalia's own shipped wallpaper. `artwork none` puts this back explicitly,
+# because clearing wallpaper.directory does NOT restore it — noctalia drops the
+# [wallpaper.default] and [wallpaper.last] tables when the directory goes away
+# and is then left with no wallpaper at all rather than with its own. Measured:
+# `noctalia msg wallpaper-get` returned an empty string in exactly that state.
+NOCTALIA_DEFAULT_WALLPAPERS = (
+    "/usr/share/noctalia/assets/noctalia-wallpaper.png",
+)
+
+SPLASH_SIZE = (1366, 768)
+EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+
+# realpath, not abspath: this is run through a symlink in ~/.local/bin, and
+# abspath would resolve HERE to that directory and point the hint below at an
+# install-plymouth.sh that is not there.
+HERE = os.path.dirname(os.path.realpath(__file__))
+INSTALL_PLYMOUTH = os.path.join(HERE, "install-plymouth.sh")
+
+
+def images_in(folder):
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names
+            if n.lower().endswith(EXTENSIONS)
+            and os.path.isfile(os.path.join(folder, n))]
+
+
+def read_source():
+    try:
+        with open(SOURCE_FILE, encoding="utf-8") as fh:
+            value = fh.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def write_source(value):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = SOURCE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(value + "\n")
+    os.replace(tmp, SOURCE_FILE)
+
+
+# --- noctalia ---------------------------------------------------------------
+
+def set_noctalia_wallpaper(folder):
+    """Point noctalia's wallpaper rotation at `folder`, or hand it back.
+
+    Edited as text rather than through a CLI because noctalia has no command
+    for the wallpaper directory — `noctalia msg` covers a lot and not this. The
+    file is its own, so the edit is narrow: the four keys below and nothing
+    else, followed by the reload that makes it take without a restart.
+    """
+    try:
+        with open(NOCTALIA_SETTINGS, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as error:
+        print(f"  ! cannot read {NOCTALIA_SETTINGS}: {error}", file=sys.stderr)
+        return False
+
+    enabled = "true" if folder else "false"
+    directory = folder or ""
+    block = (
+        "[wallpaper]\n"
+        f'directory = "{directory}"\n'
+        "transition_on_startup = true\n"
+        "\n"
+        "    [wallpaper.automation]\n"
+        f"    enabled = {enabled}\n"
+        "    interval_seconds = 1800\n"
+        '    order = "random"\n'
+        "    recursive = false\n"
+    )
+
+    if "[wallpaper]\n" in text:
+        # Replace the existing block, up to the next top-level table. The
+        # sub-table [wallpaper.automation] is indented and part of the block;
+        # [wallpaper.default] and [wallpaper.last] are noctalia's own and are
+        # left alone, so the scan stops at the first line starting with "[".
+        lines = text.splitlines(keepends=True)
+        start = next(i for i, line in enumerate(lines)
+                     if line.rstrip("\n") == "[wallpaper]")
+        end = start + 1
+        while end < len(lines) and not lines[end].startswith("["):
+            end += 1
+        text = "".join(lines[:start]) + block + "".join(lines[end:])
+    else:
+        # Insert before noctalia's own [wallpaper.default], which must stay a
+        # sub-table of [wallpaper] and therefore must come after it.
+        anchor = "[wallpaper.default]"
+        if anchor in text:
+            text = text.replace(anchor, block + "\n" + anchor, 1)
+        else:
+            text = text.rstrip("\n") + "\n\n" + block
+
+    tmp = NOCTALIA_SETTINGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, NOCTALIA_SETTINGS)
+
+    subprocess.run(["noctalia", "msg", "config-reload"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
+
+    if folder:
+        # Put one up now rather than waiting out the rotation interval, so the
+        # command visibly did something.
+        noctalia("wallpaper-random")
+    else:
+        default = next((p for p in NOCTALIA_DEFAULT_WALLPAPERS
+                        if os.path.exists(p)), None)
+        if default and noctalia("wallpaper-set", default):
+            print(f"   default wallpaper: {default}")
+        elif default is None:
+            print("  ! noctalia's default wallpaper asset is not installed;",
+                  "the desktop will keep whatever is on it", file=sys.stderr)
+    return True
+
+
+def noctalia(*args):
+    """`noctalia msg ...`, true if it reported ok."""
+    try:
+        result = subprocess.run(["noctalia", "msg", *args],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+# --- the boot splash --------------------------------------------------------
+
+def render_splashes(folder):
+    """Render every image in `folder` to a 16:9 splash rendition.
+
+    Staged here rather than written straight into the plymouth theme because
+    the theme lives under /usr/share and this runs as you. install-plymouth.sh
+    picks them up from here.
+    """
+    from PIL import Image, ImageEnhance, ImageFilter
+
+    sources = images_in(folder)
+    if not sources:
+        return 0
+
+    shutil.rmtree(SPLASH_DIR, ignore_errors=True)
+    os.makedirs(SPLASH_DIR, exist_ok=True)
+
+    target_w, target_h = SPLASH_SIZE
+    target_ratio = target_w / target_h
+    made = 0
+
+    for index, path in enumerate(sources):
+        try:
+            with Image.open(path) as image:
+                image = image.convert("RGB")
+                ratio = image.width / image.height
+
+                if ratio >= target_ratio * 0.95:
+                    scale = max(target_w / image.width, target_h / image.height)
+                    scaled = image.resize(
+                        (max(1, round(image.width * scale)),
+                         max(1, round(image.height * scale))), Image.LANCZOS)
+                    left = (scaled.width - target_w) // 2
+                    top = (scaled.height - target_h) // 2
+                    out = scaled.crop((left, top, left + target_w, top + target_h))
+                else:
+                    # Taller than the screen: the whole picture over a blurred,
+                    # darkened copy of itself, rather than cropped to a third of
+                    # itself or letterboxed onto flat black.
+                    cover = max(target_w / image.width, target_h / image.height)
+                    back = image.resize(
+                        (max(1, round(image.width * cover)),
+                         max(1, round(image.height * cover))), Image.LANCZOS)
+                    left = (back.width - target_w) // 2
+                    top = (back.height - target_h) // 2
+                    back = back.crop((left, top, left + target_w, top + target_h))
+                    back = back.filter(ImageFilter.GaussianBlur(target_w / 28))
+                    back = ImageEnhance.Brightness(back).enhance(0.55)
+                    fit = min(target_w / image.width, target_h / image.height)
+                    front = image.resize(
+                        (max(1, round(image.width * fit)),
+                         max(1, round(image.height * fit))), Image.LANCZOS)
+                    back.paste(front, ((target_w - front.width) // 2,
+                                       (target_h - front.height) // 2))
+                    out = back
+
+                out.save(os.path.join(SPLASH_DIR, f"{index:03d}.jpg"),
+                         "JPEG", quality=88, optimize=True)
+                made += 1
+        except Exception as error:
+            print(f"  - {os.path.basename(path)}: {error}", file=sys.stderr)
+    return made
+
+
+def boot_hint(count):
+    print()
+    if count:
+        print(f"  Boot splash: {count} image(s) staged.")
+    else:
+        print("  Boot splash: black.")
+    print("  That half needs root and an initramfs rebuild:")
+    print(f"      sudo bash {INSTALL_PLYMOUTH}")
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_show():
+    source = read_source()
+    if source is None:
+        print("artwork: not set")
+        print("  wallpaper   whatever noctalia is configured with")
+        print("  boot splash whatever plymouth is themed with")
+        return 0
+    if source == "none":
+        print("artwork: none")
+        print("  wallpaper   noctalia's default")
+        print("  boot splash black")
+        return 0
+    count = len(images_in(source))
+    staged = len(images_in(SPLASH_DIR))
+    print(f"artwork: {source}")
+    print(f"  {count} image(s) in the folder")
+    print(f"  wallpaper   noctalia rotates them, randomly, every 30 minutes")
+    print(f"  boot splash {staged} staged for the next install-plymouth.sh run")
+    if count != staged:
+        print("  ! folder and staged copies differ — run:  artwork refresh")
+    return 0
+
+
+def cmd_set(folder):
+    folder = os.path.abspath(os.path.expanduser(folder))
+    if not os.path.isdir(folder):
+        print(f"artwork: not a folder: {folder}", file=sys.stderr)
+        return 1
+    images = images_in(folder)
+    if not images:
+        print(f"artwork: no images in {folder}", file=sys.stderr)
+        print(f"  looked for: {', '.join(EXTENSIONS)}", file=sys.stderr)
+        return 1
+
+    print(f">> {len(images)} image(s) in {folder}")
+    print(">> Pointing noctalia's wallpaper rotation at it")
+    if not set_noctalia_wallpaper(folder):
+        return 1
+    print(">> Rendering boot splash copies")
+    count = render_splashes(folder)
+    write_source(folder)
+    print(f"   {count} rendered to {SPLASH_DIR}")
+    boot_hint(count)
+    return 0
+
+
+def cmd_none():
+    print(">> Handing the wallpaper back to noctalia")
+    if not set_noctalia_wallpaper(None):
+        return 1
+    shutil.rmtree(SPLASH_DIR, ignore_errors=True)
+    write_source("none")
+    boot_hint(0)
+    return 0
+
+
+def cmd_refresh():
+    source = read_source()
+    if not source or source == "none":
+        print("artwork: nothing to refresh — no folder is set", file=sys.stderr)
+        return 1
+    if not os.path.isdir(source):
+        print(f"artwork: folder is gone: {source}", file=sys.stderr)
+        return 1
+    print(f">> Re-rendering from {source}")
+    count = render_splashes(source)
+    print(f"   {count} rendered")
+    boot_hint(count)
+    return 0
+
+
+def cmd_pick():
+    """A folder chooser, using whatever this machine has.
+
+    zenity and kdialog are not installed here by default and yad is — the same
+    tool nightlight-gui uses — so that is the one tried first. Falling back to
+    a typed path rather than failing: this is a convenience, not the interface.
+    """
+    start = read_source() or os.path.expanduser("~/Pictures")
+    if start == "none":
+        start = os.path.expanduser("~/Pictures")
+
+    for argv in (
+        ["yad", "--file", "--directory", "--title=Artwork folder",
+         f"--filename={start}/"],
+        ["zenity", "--file-selection", "--directory", "--title=Artwork folder",
+         f"--filename={start}/"],
+        ["kdialog", "--getexistingdirectory", start],
+    ):
+        if not shutil.which(argv[0]):
+            continue
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True,
+                                    timeout=300)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            print("artwork: cancelled")
+            return 0
+        folder = result.stdout.strip().rstrip("|")
+        if folder:
+            return cmd_set(folder)
+        return 0
+
+    print("artwork: no folder chooser installed (yad, zenity or kdialog).",
+          file=sys.stderr)
+    print("  Pass the path instead:  artwork /path/to/folder", file=sys.stderr)
+    return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="artwork", description=__doc__.split("\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="artwork <folder> | none | pick | refresh")
+    parser.add_argument("target", nargs="?",
+                        help="a folder, or one of: none, pick, refresh")
+    args = parser.parse_args()
+
+    if args.target is None:
+        return cmd_show()
+    if args.target == "none":
+        return cmd_none()
+    if args.target == "pick":
+        return cmd_pick()
+    if args.target == "refresh":
+        return cmd_refresh()
+    return cmd_set(args.target)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

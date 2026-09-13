@@ -27,7 +27,13 @@ set -euo pipefail
 # a symlink from somewhere shorter to type.
 SRC="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SWAPFILE=/swapfile
-SWAPFILE_GB=${SWAPFILE_GB:-16}
+# 4G, not 16. The original 16 was sized as "as much as the disk can sensibly
+# spare", which on a 116 GB drive that later filled to 90% stopped being
+# sensible: the file sat at 0 bytes used because zram (priority 100) takes
+# everything first, while costing 16 GB of a disk with 12 GB left. 4G is a
+# little over 1x RAM, which is a real overflow tier for the case zram fills,
+# and it hands 12 GB back to the filesystem.
+SWAPFILE_GB=${SWAPFILE_GB:-4}
 KEEP_FREE_GB=20          # disk left over after the swapfile, at minimum
 SYSCTL=/etc/sysctl.d/99-oom-defender.conf
 ZRAM_CONF=/etc/systemd/zram-generator.conf
