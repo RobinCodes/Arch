@@ -35,6 +35,7 @@ gammastep backend each of those is a process launch.
 """
 
 import os
+import re
 import subprocess
 import sys
 import warnings
@@ -106,6 +107,41 @@ def scheduled_percent():
 
 def kelvin_for(percent):
     return NEUTRAL_KELVIN - percent * KELVIN_PER_PERCENT
+
+
+SCHEDULE_RE = re.compile(
+    r"^(PEAK|RISE_START|RISE_END|FALL_START|FALL_END)=([0-9]+(?:\.[0-9]+)?)\b",
+    re.MULTILINE)
+
+
+def schedule():
+    """The schedule's five constants, read out of nightlight-auto.
+
+    Read rather than restated, because restating them is how the tray's tooltip
+    and this slider's "night" mark came to say 70 each on their own, and a
+    change to the peak became four edits instead of one. Parsed rather than run:
+    the numbers are plain assignments at the top of that file, and a process
+    launch per poll to learn five constants would be the wrong trade.
+
+    Whatever cannot be read is simply absent, and callers leave out what they
+    would have said with it — no fallback copy of the numbers, which would only
+    be a fifth place for them to disagree.
+    """
+    try:
+        with open(NIGHTLIGHT_AUTO, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return {}
+    values = {}
+    for name, number in SCHEDULE_RE.findall(text):
+        values.setdefault(name, float(number) if "." in number else int(number))
+    return values
+
+
+def clock(hours):
+    """Decimal hours as HH:MM — 6.5 is 06:30."""
+    minutes = round(hours * 60)
+    return "{:02d}:{:02d}".format(minutes // 60 % 24, minutes % 60)
 
 
 def stylesheet(palette):
@@ -264,7 +300,9 @@ class Panel(Gtk.Window):
         # Marks at the schedule's own two ends, so the slider says where the
         # automatic curve would have put it without needing a second readout.
         self._scale.add_mark(0, Gtk.PositionType.BOTTOM, "off")
-        self._scale.add_mark(70, Gtk.PositionType.BOTTOM, "night")
+        peak = schedule().get("PEAK")
+        if peak is not None:
+            self._scale.add_mark(peak, Gtk.PositionType.BOTTOM, "night")
         # Connected after set_value, so seeding the slider does not apply
         # anything or knock the mode over to manual on open.
         self._scale.connect("value-changed", self._on_value_changed)

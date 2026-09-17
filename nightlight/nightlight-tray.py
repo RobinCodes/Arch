@@ -75,21 +75,28 @@ ICON_OFF = "night-light-disabled-symbolic"
 
 POLL_INTERVAL_MS = 30000
 
-# The steps the menu offers. 70 is the schedule's own peak and is labelled as
-# such, so the one value most likely to be wanted by hand is also the one that
-# does not need reading off a slider.
-STEPS = [
-    (0, "Off — 6500K"),
-    (10, "10%"),
-    (20, "20%"),
-    (30, "30%"),
-    (40, "40%"),
-    (50, "50%"),
-    (60, "60%"),
-    (70, "70% — night"),
-    (85, "85%"),
-    (100, "100% — 2500K"),
-]
+
+def steps(peak):
+    """The steps the menu offers: every ten, plus the schedule's own peak,
+    labelled as such, so the one value most likely to be wanted by hand is also
+    the one that does not need reading off a slider. The peak comes from
+    nightlight-auto (see nightlight_panel.schedule), and is added as its own
+    step if it is not already a multiple of ten."""
+    values = set(range(0, 101, 10))
+    if peak is not None:
+        values.add(peak)
+    labelled = []
+    for value in sorted(values):
+        if value == 0:
+            label = "Off — 6500K"
+        elif value == peak:
+            label = "{}% — night".format(value)
+        elif value == 100:
+            label = "100% — 2500K"
+        else:
+            label = "{}%".format(value)
+        labelled.append((value, label))
+    return labelled
 
 # Scrolling over the icon moves by this much. Coarser than the slider on
 # purpose: a scroll is a nudge, and every value it can reach is also in the menu.
@@ -110,6 +117,7 @@ class NightlightTray:
         self.mode = "auto"
         self.panel = None
         self._menu_state = None
+        self.schedule = {}
 
         self.tray = tray.Tray(APP_ID, ICON_ON, "Night light")
         self.tray.connect_scroll(self.on_scroll)
@@ -152,7 +160,10 @@ class NightlightTray:
         # presented as "the icon is there and clicking does nothing" — it was
         # rebuilding on every poll. So the menu is rebuilt only when something
         # it actually shows has changed.
-        state_key = (self.percent, self.mode)
+        # The schedule is in the key so that editing nightlight-auto's peak or
+        # times reaches the menu at the next poll, not at the next restart.
+        self.schedule = nightlight_panel.schedule()
+        state_key = (self.percent, self.mode, tuple(sorted(self.schedule.items())))
         if state_key != self._menu_state:
             self._menu_state = state_key
             self.tray.set_menu(self.build_menu())
@@ -169,10 +180,15 @@ class NightlightTray:
         auto = tray.check_item(
             "Automatic schedule", self.mode == "auto", self.on_auto_toggled
         )
-        auto.set_tooltip_text(
-            "0% through the day, rising from 16:00 to 70% at 19:00, back to 0% "
-            "by 06:30"
-        )
+        sched = self.schedule
+        if all(k in sched for k in ("PEAK", "RISE_START", "RISE_END", "FALL_END")):
+            auto.set_tooltip_text(
+                "0% through the day, rising from {} to {}% at {}, back to 0% "
+                "by {}".format(
+                    nightlight_panel.clock(sched["RISE_START"]), sched["PEAK"],
+                    nightlight_panel.clock(sched["RISE_END"]),
+                    nightlight_panel.clock(sched["FALL_END"]))
+            )
         menu.append(auto)
         menu.append(tray.separator())
 
@@ -181,7 +197,7 @@ class NightlightTray:
         # marked when the value came from a step — a scheduled 43% leaves all
         # ten unmarked, which is honest, and the tooltip carries the number.
         group = []
-        for value, label in STEPS:
+        for value, label in steps(self.schedule.get("PEAK")):
             item = Gtk.RadioMenuItem.new_with_label(group, label)
             group = item.get_group()
             item.set_active(value == self.percent)

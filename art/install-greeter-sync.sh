@@ -5,8 +5,11 @@
 # Run:  sudo bash install-greeter-sync.sh
 #   or: sudo bash install-greeter-sync.sh --undo
 #
+# This is half of the fix. The other half is one line in your own noctalia
+# settings and needs no root — `artwork refresh` writes it. Read on.
 #
-# WHAT WAS FAILING
+#
+# WHAT WAS FAILING, AND WHY THE FIRST DIAGNOSIS WAS WRONG
 #
 # noctalia syncs the current wallpaper and palette to its own login greeter, so
 # the screen you log in on matches the one you log in to. The greeter's files
@@ -19,17 +22,38 @@
 #         <allow_inactive>auth_admin</allow_inactive>
 #         <allow_active>auth_admin</allow_active>
 #
-# auth_admin on all three, so every sync wants the admin password. The sync runs
-# on its own whenever the wallpaper changes, which means a password prompt fires
-# at moments nobody asked for anything — at session start, and on every rotation
-# if a wallpaper folder is set. From the log:
+# auth_admin on all three, so the obvious conclusion was that every sync wants
+# the admin password, and the obvious fix was a rule granting that action. This
+# file wrote that rule, and the password prompts carried on.
 #
-#     22:55:25.659  panel manager: opened "polkit"
-#     22:55:50.579  greeter sync failed: Connection timed out
-#     22:55:50.728  panel manager: closing "polkit"
+# They carried on because that action was never the one being asked for. noctalia
+# does not call the helper directly — it runs it through whichever privilege
+# wrapper it finds, and it looks for `run0` before `pkexec`. run0 does its work
+# by asking systemd for a transient unit, so the action that actually reaches
+# polkit is org.freedesktop.systemd1.manage-units. From polkitd's own log, at
+# exactly the 1800-second wallpaper rotation interval:
 #
-# A prompt nobody was looking at, timing out 25 seconds later into a failure
-# notification. That is the notification, and this is why it appeared.
+#     16:35:58  FAILED to authenticate ... org.freedesktop.systemd1.manage-units
+#     17:05:58  FAILED to authenticate ... org.freedesktop.systemd1.manage-units
+#
+# A prompt nobody was looking at, half an hour apart, failing into a notification.
+#
+# So there are two halves:
+#
+#   this file    grants org.noctalia.greeter.apply-appearance to you. Pinned to
+#                the one action id and the one user.
+#
+#   artwork      sets [shell.greeter_sync] privilege_command = "pkexec" in your
+#                noctalia settings, which sends the call through the action this
+#                rule is about instead of through run0. No root, no prompt.
+#
+# The rule without the setting does nothing, which is what happened the first
+# time. The setting without the rule turns a run0 prompt into a pkexec prompt.
+#
+# Granting manage-units instead would have "worked" too, and would have meant
+# handing the account permission to start, stop and restart every unit on the
+# system — the whole of root — for the sake of a picture on the login screen.
+# That is why it is not what this does.
 #
 #
 # WHAT THIS CHANGES, AND WHAT IT COSTS
@@ -47,7 +71,9 @@
 # The honest cost: the login screen's appearance can now be changed without a
 # password by anything running as you. On a single-user laptop that is the same
 # trust boundary as the session itself. On a shared machine, do not install this
-# — press Cancel on the prompt instead and let the greeter keep its own look.
+# — press Cancel on the prompt instead and let the greeter keep its own look,
+# or turn the sync off entirely with
+# [shell.greeter_sync] auto_sync = false.
 set -euo pipefail
 
 RULE=/etc/polkit-1/rules.d/49-noctalia-greeter-sync.rules
@@ -92,9 +118,15 @@ cat >"$RULE" <<EOF
 // automatic background copy into an unprompted password dialog that times out
 // into a failure notification.
 //
-// Pinned to one action id and one user on purpose. polkit evaluates rules in
-// name order and the first Result wins, so the 49- prefix keeps this ahead of
-// the 50- defaults without outranking anything an administrator adds below it.
+// This is only half of it: noctalia reaches this action only when
+// [shell.greeter_sync] privilege_command is "pkexec". Left to itself it picks
+// run0, which asks for org.freedesktop.systemd1.manage-units instead and is
+// not covered by this rule on purpose — that action is every unit on the box.
+// \`artwork refresh\` writes the setting.
+//
+// Pinned to one action id and one user. polkit evaluates rules in name order
+// and the first Result wins, so the 49- prefix keeps this ahead of the 50-
+// defaults without outranking anything an administrator adds below it.
 polkit.addRule(function (action, subject) {
     if (action.id === "$ACTION" && subject.user === "$USER_NAME") {
         return polkit.Result.YES;
@@ -114,9 +146,32 @@ if journalctl -u polkit --since "10 seconds ago" --no-pager 2>/dev/null \
     journalctl -u polkit --since "10 seconds ago" --no-pager | tail -5 >&2
     exit 1
 fi
-
 echo "   $RULE"
+
+# Did it take? pkcheck without --allow-user-interaction answers without opening
+# anything, so this can be asked rather than found out at the next rotation.
+# $$ has to expand inside the runuser shell, not out here: out here it is this
+# script's PID, which root owns, and the answer would be about root.
+if command -v pkcheck >/dev/null \
+   && ! runuser -u "$USER_NAME" -- bash -c \
+        'pkcheck --action-id "$1" --process $$' _ "$ACTION" >/dev/null 2>&1; then
+    echo "   ! polkit still will not grant it to $USER_NAME. Check for another"
+    echo "   ! rule in /etc/polkit-1/rules.d that sorts before 49- and returns"
+    echo "   ! a Result for this action." >&2
+fi
+
+# The other half, which is not root's to write.
+STATE_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)/.local/state
+SETTINGS="$STATE_HOME/noctalia/settings.toml"
 echo
-echo "Done. The next wallpaper change syncs to the greeter without a prompt."
-echo "Test it now, as $USER_NAME:   noctalia msg greeter-sync"
+if grep -q 'privilege_command *= *"pkexec"' "$SETTINGS" 2>/dev/null; then
+    echo "The wrapper is already pinned to pkexec. Nothing else to do."
+else
+    echo "Now the other half, as $USER_NAME — without it noctalia keeps using"
+    echo "run0 and this rule never comes up:"
+    echo
+    echo "    artwork refresh"
+fi
+echo
+echo "Test it:   noctalia msg greeter-sync     (no prompt should appear)"
 echo "Undo:  sudo bash $0 --undo"

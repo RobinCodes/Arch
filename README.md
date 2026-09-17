@@ -381,16 +381,77 @@ consumers.
 
 | File | Role |
 |---|---|
-| `artwork` | The selector. `artwork <folder>` uses that folder, `artwork none` hands the desktop back to noctalia and makes the boot black, `artwork pick` opens a folder chooser, `artwork refresh` re-renders after you add images. Run as yourself. |
+| `artwork` | The selector. `artwork <folder>` rotates through that folder, `artwork <file>` holds one picture, `artwork none` hands the desktop back to noctalia and makes the boot black, `artwork pick` opens a chooser, `artwork refresh` re-renders after you add images, `artwork next` / `prev` / `random` move the rotation along by hand and `artwork which` prints the picture on screen. Run as yourself. |
 | `install-plymouth.sh` | The boot half: builds the plymouth theme from whatever `artwork` staged, adds the mkinitcpio hook, and rebuilds the UKI. Needs `sudo`. `--undo` removes it. |
-| `install-greeter-sync.sh` | One polkit rule so noctalia can push the wallpaper to its greeter without a password prompt. `--undo` removes it. |
+| `install-greeter-sync.sh` | One polkit rule, so noctalia can push the wallpaper to its greeter without a password prompt. Half of that fix; `artwork` writes the other half. `--undo` removes it. |
 | `fetch-ukiyoe.py` | One optional source: public-domain Japanese woodblock prints from the Met's open-access API. Nothing depends on it — it just fills a folder that `artwork` can then be pointed at. |
 
 ```bash
-artwork ~/Pictures/wallpapers     # use a folder
+artwork ~/Pictures/wallpapers     # rotate through a folder
+artwork ~/Pictures/one.jpg        # hold one picture
 artwork none                      # noctalia's default, black boot
 sudo bash art/install-plymouth.sh # apply the boot half
+
+artwork next                      # the next picture, now
+artwork prev                      # the one before
+artwork random                    # any of them
+artwork which                     # the path on screen, bare
+xdg-open "$(artwork which)"       # …so it composes
 ```
+
+`next`, `prev` and `random` check noctalia's `wallpaper.directory`, not
+artwork's own record, because that is what noctalia steps through: a held file
+and `none` both leave it empty and get told so, while a folder chosen from
+noctalia's own settings window steps just as well as one chosen here. They
+nudge the rotation without resetting its timer, and print where they landed —
+including when a folder of one picture means they landed where they started, so
+a no-op does not look like a failure.
+
+`which` prints the path and nothing else on stdout, and exits 1 with its
+complaint on stderr, so `$(artwork which)` is either a file or empty. With more
+than one screen, `--output eDP-1` (any connector name niri knows) narrows any of
+the four to one of them; without it they act on all screens, and `which` reports
+noctalia's default.
+
+### Three settings, and where they live
+
+| Flag | What it sets | Values |
+|---|---|---|
+| `--fit MODE` | how a picture meets a screen it does not match | `center` `crop` `fit` `stretch` `repeat` `span` |
+| `--background COLOUR` | what shows where the picture does not reach | `#rrggbb`, `#rrggbbaa`, `#rgb`, a noctalia palette role such as `surface`, or `''` for none |
+| `--every SECONDS` | how long each picture stays up | whole seconds (5 or more), or `off` to hold one |
+
+They can ride along with a source, or be given on their own to change just that
+and leave the source alone:
+
+```bash
+artwork ~/Pictures/art --fit fit --background '#101010' --every 600
+artwork --every 30                # just the interval
+artwork --fit stretch             # just the fit
+artwork                           # print everything that is set
+```
+
+**There is no artwork config file.** All three live in noctalia's
+`settings.toml` — `wallpaper.fill_mode`, `wallpaper.fill_color` and
+`wallpaper.automation.interval_seconds` — because a second copy of `fill_mode`
+is a second thing to disagree. `artwork` edits that file **one key at a time**,
+never by block, and refuses the write unless it still parses, nothing outside
+the keys it named has moved, every change actually landed, and
+`noctalia config validate` accepts the result. The previous file is kept beside
+it as `settings.toml.artwork-bak`.
+
+The boot splash honours the same two: `--fit` picks how each picture is fitted
+to 1366x768, and `--background` fills what is left over. A palette role has no
+meaning outside noctalia, so when the background is one of those the splash
+keeps its own treatment — a blurred, darkened copy of the picture behind itself,
+which beats flat black for a portrait picture on a landscape screen.
+
+> **The block rewrite that ate noctalia's own tables.** Until now `artwork`
+> replaced the whole `[wallpaper]` block, scanning to "the next line starting
+> with `[`" to find the end. noctalia indents its sub-tables by four spaces, so
+> that scan stopped at none of them and `[wallpaper.default]`,
+> `[wallpaper.last]` and `[wallpaper.monitors.*]` went every single time. That
+> is what the note below used to blame on noctalia. It was this.
 
 ### One choice, two consumers
 
@@ -405,16 +466,24 @@ completely different ways:
   rendered to 1366x768 PNG8 and baked in. That is why the wallpaper half is
   instant and the boot half needs root and a rebuild.
 
+**One file is not a folder of one.** `artwork <file>` clears
+`wallpaper.directory`, turns `wallpaper.automation` off and sets that one
+picture through `noctalia msg wallpaper-set`, then reads it back with
+`wallpaper-get` to check it took. Pointing the rotation at the file's *parent*
+would have been the lazy version and would have quietly picked up every other
+picture in it.
+
 `none` is not "no wallpaper". It hands the desktop back to noctalia's own
 default and makes the boot splash plain black.
 
-> **Clearing `wallpaper.directory` is not enough to get the default back.**
-> noctalia drops its own `[wallpaper.default]` and `[wallpaper.last]` tables
-> when the directory goes away, and is then left with no wallpaper at all rather
-> than with its own — `noctalia msg wallpaper-get` returns an empty string in
-> exactly that state. `artwork none` therefore also runs
-> `noctalia msg wallpaper-set /usr/share/noctalia/assets/noctalia-wallpaper.png`
-> explicitly.
+> **`artwork none` also sets the default wallpaper explicitly**, with
+> `noctalia msg wallpaper-set /usr/share/noctalia/assets/noctalia-wallpaper.png`,
+> rather than only clearing `wallpaper.directory` — so the desktop changes when
+> you run the command instead of at some later reload. This used to be here for
+> a different and wrong reason: `[wallpaper.default]` and `[wallpaper.last]` did
+> disappear whenever the directory was cleared, and noctalia was blamed for it.
+> The block rewrite above was deleting them. It no longer does, and they survive
+> `artwork none` now.
 
 ### The sequence
 
@@ -462,10 +531,9 @@ holds until the greeter's compositor takes the display.
 ### The greeter sync, and why it kept asking for a password
 
 noctalia copies the current wallpaper and palette to its own greeter, through a
-root helper behind a polkit action whose shipped policy is `auth_admin` on all
-three of `allow_any`, `allow_inactive` and `allow_active`. The sync runs by
-itself whenever the wallpaper changes, so a password dialog fired at moments
-nobody asked for anything:
+root helper behind a polkit action. The sync runs by itself whenever the
+wallpaper changes, so a password dialog fired at moments nobody asked for
+anything:
 
 ```
 22:55:25.659  panel manager: opened "polkit"
@@ -474,14 +542,61 @@ nobody asked for anything:
 ```
 
 A prompt nobody was looking at, timing out 25 seconds later into the failure
-notification. `install-greeter-sync.sh` writes one rule pinned to that action id
-and one named user.
+notification.
 
-> **What it costs.** The login screen's appearance can then be changed without a
-> password by anything running as you. The helper is a fixed path named in the
-> policy, so it is not a route to running something else as root, and the user
-> granted it is already in `wheel` — a far larger grant. On a shared machine,
-> skip it and press Cancel on the prompt instead.
+The shipped policy for `org.noctalia.greeter.apply-appearance` is `auth_admin`
+on all three of `allow_any`, `allow_inactive` and `allow_active`, so that looked
+like the whole answer, and `install-greeter-sync.sh` granted exactly that action
+to exactly this user. **The prompts carried on**, because that action was never
+the one being asked for.
+
+noctalia does not run the helper directly. It runs it through whichever
+privilege wrapper it finds, and it looks for `run0` before `pkexec`. run0 does
+its work by asking systemd for a transient unit, so the action that actually
+reaches polkit is `org.freedesktop.systemd1.manage-units`. polkitd's own log,
+at exactly the 1800-second rotation interval:
+
+```
+16:35:58  FAILED to authenticate ... org.freedesktop.systemd1.manage-units
+17:05:58  FAILED to authenticate ... org.freedesktop.systemd1.manage-units
+```
+
+Half an hour apart, to the second. That is the wallpaper rotating.
+
+So the fix is two halves, and either alone does nothing useful:
+
+| Half | What | Root? |
+|---|---|---|
+| `install-greeter-sync.sh` | one polkit rule granting `org.noctalia.greeter.apply-appearance` to one named user | yes, once |
+| `artwork` | `[shell.greeter_sync] privilege_command = "pkexec"`, written by any `artwork` command that touches settings — the smallest is `artwork refresh` | no |
+
+`pkexec` sends the call through the action the policy — and that rule — is
+about. With both in place the sync is silent:
+
+```
+22:24:58  pkexec[35604]: pam_unix(polkit-1:session): session opened for user root by robin
+```
+
+pkexec ran the helper, `/var/lib/noctalia-greeter/` was written, and polkitd
+logged nothing at all. No agent, no dialog, no password.
+
+> **Why not just grant `manage-units`?** It would have worked, and it would have
+> meant granting the account permission to start, stop and restart every unit on
+> the system — the whole of root — for the sake of a picture on the login
+> screen. The narrow action is the one worth having.
+
+> **What the narrow one costs.** The login screen's appearance can then be
+> changed without a password by anything running as you. The helper is a fixed
+> path named in the policy, so it is not a route to running something else as
+> root, and the user granted it is already in `wheel` — a far larger grant. On a
+> shared machine, skip it: set `[shell.greeter_sync] auto_sync = false` and let
+> the greeter keep its own look. `artwork` leaves the wrapper alone when the
+> sync is off, because there is then nothing to make silent.
+
+`artwork` with no arguments says which of the two are in place, asking polkit
+with `pkcheck` rather than looking for the rule file — `/etc/polkit-1/rules.d`
+is not readable as a user, and `pkcheck` without `--allow-user-interaction`
+answers without opening a dialog of its own.
 
 ---
 
@@ -782,10 +897,10 @@ for a `gammastep` swap.
 ### The curve
 
 ```
-70% ┤        ╭─────────────────╮
+80% ┤        ╭─────────────────╮
     │       ╱                   ╲
     │      ╱                     ╲
-35% ┤     ╱                       ╲
+40% ┤     ╱                       ╲
     │    ╱                         ╲
  0% ┼───╯                           ╰────
     16:00  19:00          05:00  06:30
@@ -794,21 +909,30 @@ for a `gammastep` swap.
 | Window | Intensity |
 |---|---|
 | 06:30 → 16:00 | 0% — neutral. The screen is not tinted at all during the day. |
-| 16:00 → 19:00 | rising, 0% → 70% |
-| 19:00 → 05:00 | 70% (3700K), across midnight |
-| 05:00 → 06:30 | falling, 70% → 0% |
+| 16:00 → 19:00 | rising, 0% → 80% |
+| 19:00 → 05:00 | 80% (3300K), across midnight |
+| 05:00 → 06:30 | falling, 80% → 0% |
 
 Four times and one ceiling, all constants at the top of `nightlight-auto`, and
 that file is the only place the curve is written down — the login screen asks it
-for a number rather than carrying a copy.
+for a number rather than carrying a copy, and the tray and the panel read the
+five `NAME=number` lines straight out of it (`schedule()` in
+`nightlight-panel.py`) for the "night" step, the slider's "night" mark and the
+schedule tooltip.
 
-`PEAK` is 70 rather than 100 because the bottom of the 0–100 scale is 2500K,
-which is deep amber and further than this screen wants to go. 70 lands at 3700K.
-It caps the *schedule*, not the control: `nightlight 100` by hand still goes all
-the way.
+> **That used to be untrue.** The tray's tooltip and step list and the panel's
+> mark each carried their own 70, so raising the peak meant four edits and
+> missing one meant a menu labelling the wrong value "night". Now changing
+> `PEAK` is the whole change: a peak that is not a multiple of ten gets a step of
+> its own, and a running tray picks it up at its next 30-second poll.
+
+`PEAK` is 80, landing at 3300K. It was 70 (3700K) and was raised for a warmer
+night; the last 20%, down to the 2500K deep amber at 100, stays out of the
+schedule. It caps the *schedule*, not the control: `nightlight 100` by hand
+still goes all the way.
 
 **The two ramps are eased, not straight.** The endpoints are exactly the times
-above — "0% at 06:30" and "70% at 19:00" hold literally — and the easing only
+above — "0% at 06:30" and "80% at 19:00" hold literally — and the easing only
 decides the shape between them. A straight ramp has a corner at each end, where
 the rate of change goes from nothing to its full value in a single tick, and the
 corner is the part the eye catches: the screen looks still, then visibly starts
@@ -1146,7 +1270,10 @@ and not three `niri msg` aliases:
    respects it gets all five right at once. There is no Xft DPI here and nothing
    sets one: a scale of 1.5 *is* how you say "144 dpi" to a Wayland client.
 3. **The greeter, told.** `noctalia msg greeter-sync` pushes the layout to the
-   login screen, replacing the 309-line `monitor-greeter`.
+   login screen, replacing the 309-line `monitor-greeter`. It goes through the
+   same privilege wrapper as the wallpaper sync, so it is silent for the same
+   reason and needs the same two halves — see
+   [the greeter sync](#the-greeter-sync-and-why-it-kept-asking-for-a-password).
 
 The scale is quantised to `SCALE_STEP` (0.25 by default). niri accepts arbitrary
 fractional scales, but the quarter steps are the ones clients and icon themes

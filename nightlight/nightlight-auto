@@ -3,16 +3,19 @@
 #
 # THE CURVE
 #
-#   16:00 → 19:00   rise   0% → 70%
-#   19:00 → 05:00   hold   70%          (across midnight)
-#   05:00 → 06:30   fall   70% → 0%
+#   16:00 → 19:00   rise   0% → 80%
+#   19:00 → 05:00   hold   80%          (across midnight)
+#   05:00 → 06:30   fall   80% → 0%
 #   06:30 → 16:00   hold   0%           (neutral; the screen is not tinted)
 #
 # Four times and one ceiling, all just below. Editing them is the supported way
 # to change the schedule — nothing else in this repo has a copy of the curve.
+# The tray's tooltip and step labels and the panel's "night" mark *read* these
+# five lines rather than repeating them (nightlight-panel.py, `schedule`), so
+# keep each one a plain NAME=number assignment at the start of its line.
 #
 # The two ramps are eased rather than straight lines. The endpoints are exactly
-# the times above, so "0% at 06:30" and "70% at 19:00" hold literally; the
+# the times above, so "0% at 06:30" and "80% at 19:00" hold literally; the
 # easing only decides the shape between them. A straight ramp has a corner at
 # each end, where the rate of change goes from nothing to its full value in one
 # tick, and a corner is the part the eye actually catches — the screen looks
@@ -30,15 +33,15 @@ MODE_FILE="$STATE/mode"
 KELVIN_FILE="$STATE/kelvin"
 LEGACY_CONF="$HOME/.config/redshift/redshift.conf"
 
-# The ceiling the schedule ever reaches, as a % of nightlight's 0-100 scale.
-# 70 rather than 100: the bottom of that scale is 2500K, which is deep amber and
-# further than this screen wants to go. 70 lands at 3700K — still clearly warm
-# at night, without the colour cast that made the last 30% unusable.
+# The ceiling the schedule ever reaches, as a % of nightlight's 0-100 scale, at
+# 40K a percent down from 6500K. 80 lands at 3300K. It was 70 (3700K) and was
+# raised for a warmer night; the last 20%, down to the 2500K deep amber at 100,
+# is still left out of the schedule.
 #
 # This caps the *schedule* only. `nightlight 100` by hand still goes all the way
 # and holds there until automatic mode is switched back on; the ceiling is what
 # the automation chooses, not a limit on what you can ask for.
-PEAK=70
+PEAK=80
 
 # Decimal hours. 6.5 is 06:30.
 RISE_START=16.0   # nothing before this: the day is neutral, not faintly warm
