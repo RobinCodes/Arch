@@ -1,0 +1,5 @@
+# Python bytecode. Regenerated whenever a script runs, so tracking it meant
+# the working tree went dirty every time anything on this machine used the
+# trays -- noise that hides the changes worth looking at.
+__pycache__/
+*.py[cod]
