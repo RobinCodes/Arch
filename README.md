@@ -890,7 +890,7 @@ for a `gammastep` swap.
 | `nightlight-panel.py` | The slider, as a floating window in noctalia's colours. |
 | `nightlight-gui` | Now a one-line launcher for the panel, kept because the keybinding and the `.desktop` point at the name. |
 | `gamma-apply` | Owns "the screen is at K right now". Picks a backend — `wl-gammarelay-rs`, `gammastep`, `wlsunset`, or `redshift` on X11 — and keeps it alive. Swaps holders old-first, because `wlr-gamma-control` is exclusive, and serialises swaps behind an `flock` so a slider drag cannot interleave them. |
-| `nightlight-login` | Applies the schedule as the session comes up, from XDG autostart. Twice, three seconds apart — the culprit changed from xfsettingsd's display pass to noctalia, which implements `wlr-gamma-control` itself and can take the ramp while starting up. |
+| `nightlight-login` | Applies whatever should be on screen as the session comes up, from XDG autostart — the scheduled value in auto mode, the recorded one in manual, both via `nightlight-auto --print`. Twice, three seconds apart — the culprit changed from xfsettingsd's display pass to noctalia, which implements `wlr-gamma-control` itself and can take the ramp while starting up. It used to run `nightlight-auto` itself, which left manual mode neutral after a reboot: the Wayland ramp dies with the session, and in manual mode `nightlight-auto` applies nothing by design, so nothing ever put the hand-set value back. |
 | `nightlight-greeter` | **Inert.** Was the same for the LightDM login screen. greetd is the display manager now. |
 | `install-nightlight-greeter.sh` | Refuses and explains, unless `FORCE_LIGHTDM=1`. |
 
@@ -1524,6 +1524,8 @@ for when you're somewhere you'd rather just open the lid.
 | `nolock` | The CLI and the single owner of the setting. `nolock` prints `on` or `off` plus what each switch currently reads; `nolock on\|off\|toggle` changes it. |
 | `nolock-tray.py` | The tray icon: **open padlock** = nolock on (wake straight into the session), **closed padlock** = a password on wake. The menu carries the toggle, *Lock Now*, and noctalia's settings. |
 | `noctalia-setting.py` | Reads and writes one boolean in noctalia's `settings.toml`, which is how the niri-side switches are reached — noctalia has no IPC command for them. Unused under XFCE, where xfconf is the store. |
+| `20-lid-lock.conf` | `HandleLidSwitch=lock` plus the external-power twin. Installed to `/etc/systemd/logind.conf.d/`. The one lock trigger that is root-owned rather than a `nolock` switch. |
+| `install-lid-lock.sh` | One-shot `sudo` install of that drop-in. Applies it with `systemctl reload systemd-logind`, which re-reads the config in place without dropping the seat. |
 
 **The lock triggers are different objects in the two sessions**, so `nolock`
 carries a table per backend and the generic on/off/snapshot/restore logic runs
@@ -1548,17 +1550,46 @@ decides what the lid means.
 with it on `Super+Alt+L` still locks on demand while nolock is on — exactly the
 reasoning that kept `/lock/enabled` untouched under XFCE.
 
-**The lid pair has no equivalent and is reported rather than changed.**
-`xfce4-power-manager` held a logind `handle-lid-switch` inhibitor and decided
-for itself what a lid close meant, which is why it could be told "blank the
-screen" instead of "lock" — and why it took so long to find, since closing the
-lid never slept the machine and none of the sleep switches ever got a say.
-Nothing in this session takes that inhibitor, so the lid belongs to logind
-again and `HandleLidSwitch` lives in `/etc/systemd/logind.conf`: root-owned
-system configuration, not a per-user toggle. With `lock_before_suspend` off, a
-lid close still suspends and still comes back without asking, which is the
-outcome that was wanted. `nolock status` prints the current lid action so the
-whole picture is in one place.
+**The lid pair has no equivalent and is root-owned rather than a `nolock`
+switch.** `xfce4-power-manager` held a logind `handle-lid-switch` inhibitor and
+decided for itself what a lid close meant, which is why it could be told "blank
+the screen" instead of "lock" — and why it took so long to find, since closing
+the lid never slept the machine and none of the sleep switches ever got a say.
+Nothing in this session takes that inhibitor, so the lid belongs to logind again
+and `HandleLidSwitch` is system configuration, not a per-user toggle. `nolock
+status` prints the current lid action so the whole picture stays in one place.
+
+> **Changed 2026-10-09: the lid locks instead of suspending.** logind's default
+> is `suspend`, and `systemd-sleep` freezes the whole of `user.slice` on the way
+> down — "Successfully froze unit 'user.slice'" lands in the journal immediately
+> before "Performing sleep operation 'suspend'". That made the lid the **only**
+> thing in this session that stopped a running process: `Super+Alt+L` just
+> raises a lock screen and `Mod+Shift+P` just powers the output off, and neither
+> touches a PID. So the rule now enforced is that locking and blanking leave
+> work running and only an explicit sleep stops it. `nolock/20-lid-lock.conf`
+> sets `HandleLidSwitch=lock` and `HandleLidSwitchExternalPower=lock`, so a lid
+> close locks, blanks, and leaves the download running. `lock` is reachable
+> because noctalia registers a logind session lock listener at startup and
+> reports back through `SetLockedHint`; niri powers the internal output down on
+> lid close by itself, so the screen-off half needed nothing.
+>
+> **The cost, accepted deliberately:** nothing sleeps this laptop on its own any
+> more. `IdleAction` is logind's `ignore` default and all three noctalia idle
+> behaviours are `enabled = false`, so there is no timeout left to fall back on
+> — a machine shut in a bag stays awake, gets warm and flattens the battery.
+> Suspending is a manual act now: the session menu, or `systemctl suspend`.
+> `HandleLidSwitchDocked` stays at `ignore`, because docked means an external
+> screen is attached and locking would interrupt work that is still visible.
+>
+> **And it costs `nolock` the lid.** "nolock on, shut the lid, open it straight
+> back into the session" no longer works. `nolock` never could change the lid
+> action — only the switches on the *sleep* path — and the lid is not on that
+> path any more, so `lock_before_suspend` never gets consulted. The prompt now
+> comes from logind's own `lock`, which reaches noctalia through the session
+> `Lock` signal and is gated only by `lockscreen.enabled`, the master switch
+> `nolock` deliberately leaves alone. `nolock on` still works as advertised for
+> a real suspend. If waking without a password matters more than the lid
+> leaving work running, the lid action is the thing to put back.
 
 **Why the table grew a column.** The XFCE version got away with one value doing
 double duty: for all five of its keys, the value meaning "this would lock" was
@@ -2123,6 +2154,7 @@ re-running the matching `install-*.sh` is what updates them:
 | `/etc/fstab` | the `/swapfile` line, appended by the same script |
 | `/usr/local/bin/unstick-keyboard` | a copy of `keyboard/unstick-keyboard` |
 | `/etc/systemd/logind.conf.d/10-inhibit-delay.conf` | a copy of `keyboard/10-inhibit-delay.conf` |
+| `/etc/systemd/logind.conf.d/20-lid-lock.conf` | a copy of `nolock/20-lid-lock.conf` |
 | `/usr/local/libexec/battery-power-profile` | a copy of `battery/power-profile-apply` |
 | `/etc/sudoers.d/battery-power-profile` | the NOPASSWD rule naming that path |
 

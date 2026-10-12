@@ -34,8 +34,27 @@
 # logind's HandleLidSwitch lives in /etc/systemd/logind.conf — root-owned
 # system configuration, not a per-user toggle. Changing it is a different kind
 # of act from flipping a setting in your own session, so nolock reports it and
-# does not touch it. With lock_before_suspend off, a lid close still suspends
-# and still comes back without asking, which is the outcome that was wanted.
+# does not touch it.
+#
+# Since 2026-10-09 that reported value is `lock`, not the stock `suspend`, set
+# by nolock/20-lid-lock.conf. The reason is not about passwords at all: logind's
+# `suspend` freezes the whole of user.slice on the way down, which made the lid
+# the only thing in this session that stopped a running process. A lid close now
+# locks and blanks and leaves work running.
+#
+# THE KNOCK-ON FOR NOLOCK, which is a real loss and not a detail: nolock can no
+# longer skip the password prompt on a lid close. It never could change the lid
+# action, only the switches on the *sleep* path, and the lid is not on that path
+# any more -- lock_before_suspend is what nolock turns off, and a lid close no
+# longer goes near it. The prompt now comes from logind's own `lock` action,
+# which reaches noctalia through the session Lock signal and is gated only by
+# lockscreen.enabled, the master switch nolock deliberately leaves alone.
+#
+# So the old behaviour of "nolock on, shut the lid, open it straight back into
+# the session" is gone, and it was traded for the lid not stopping your
+# processes. `nolock on` still does exactly what it says for an actual suspend.
+# If the wake-without-asking mattered more, the lid action is the thing to
+# change back -- see nolock/20-lid-lock.conf.
 #
 # WHY THERE ARE FIVE COLUMNS BELOW AND NOT FOUR
 #

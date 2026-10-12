@@ -1,14 +1,33 @@
 #!/usr/bin/env bash
-# Applies the scheduled intensity as soon as the session comes up, so the
-# desktop is already warm on arrival. Without this the first colour change came
-# from the timer's OnStartupSec=30 tick, i.e. ~40s in, because a fresh session
-# starts with neutral gamma and nothing else sets it.
+# Applies the intensity that should be on screen as soon as the session comes
+# up, so the desktop is already right on arrival. Without this the first colour
+# change came from the timer's OnStartupSec=30 tick, i.e. ~40s in, because a
+# fresh session starts with neutral gamma and nothing else sets it.
 #
 # Runs from ~/.config/autostart/nightlight-login.desktop. That file used to
 # carry OnlyShowIn=XFCE, which meant systemd's xdg-autostart generator skipped
 # it outright under niri -- the unit existed and was never allowed to run. The
 # line is gone; niri --session activates xdg-desktop-autostart.target like any
 # other session, so the entry is honoured now.
+#
+# WHY THIS NO LONGER JUST RUNS nightlight-auto
+#
+# It used to, and that left manual mode with no colour at all after a reboot.
+# nightlight-auto owns the schedule, so in manual mode it deliberately does
+# nothing -- and "nothing" is the right answer mid-session, where the ramp is
+# already being held. At login it is not: on Wayland the ramp belongs to the
+# client that set it and dies with the session, so a fresh session is neutral
+# until something applies a value. The schedule applies one on every tick and
+# so always recovered on its own; manual mode never did. The screen sat at
+# 6500K while `kelvin` still recorded the hand-set value, so the CLI, the tray
+# and the panel all reported 90% at a plainly neutral screen -- the state was
+# not lost, it just never reached the hardware.
+#
+# `nightlight-auto --print` is already the single answer to "what should be on
+# screen right now": the scheduled value in auto mode, the recorded one in
+# manual. So this asks that and applies it, which is correct in both modes and
+# keeps the curve in one place. --auto is how a value is applied without
+# claiming it was hand-set, so the mode is left exactly as it was found.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Applied twice, for a reason that survived the port with a different culprit.
@@ -16,8 +35,20 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # wiping the ramp. Here it is the shell: noctalia implements wlr-gamma-control
 # itself, and if it takes the control while starting up, whatever it sets
 # replaces what we set. Re-asserting once it has settled costs nothing --
-# nightlight-auto is idempotent, and gamma-apply swaps holders new-first so the
-# second pass does not flicker.
-"$DIR/nightlight-auto"
+# applying a temperature is idempotent, and wl-gammarelay-rs retunes the ramp
+# in place rather than restarting a holder, so the second pass does not flicker.
+apply() {
+    local pct
+    pct=$("$DIR/nightlight-auto" --print)
+    # A state directory that is missing or caught mid-write prints nothing
+    # rather than a number. Applying "" is a usage error and applying 0 is a
+    # confident claim that the night light is off, so neither is worth doing:
+    # leave the screen alone and let the next pass, or the next tick, have it.
+    [[ "$pct" =~ ^[0-9]+$ ]] || return 0
+    "$DIR/nightlight" --auto "$pct" >/dev/null
+    echo "login: ${pct}%"
+}
+
+apply
 sleep 3
-"$DIR/nightlight-auto"
+apply
