@@ -1,0 +1,71 @@
+#!/bin/bash
+# theme-mode [dark|light|toggle]  — switch the whole desktop between light
+# theme-mode --print              — the current mode, bare, for scripts.
+#
+# With no argument it toggles, which is what the keybinding uses.
+#
+# WHY THIS EXISTS RATHER THAN ONE SETTING
+#
+# There is no single switch on this machine. Two things have to be told, and
+# neither of them tells the other:
+#
+#   gsettings  org.gnome.desktop.interface color-scheme
+#       The desktop-wide preference. xdg-desktop-portal-gtk reads it and
+#       republishes it as `org.freedesktop.appearance color-scheme` on the
+#       settings portal, which is the thing every well-behaved application
+#       actually watches — the nine apps in Projects/Programming/Apps, GTK4
+#       and libadwaita generally, Firefox, Qt apps built against the portal.
+#       They change the moment it does; nothing needs restarting.
+#
+#   noctalia msg theme-mode-set
+#       The bar, the dock, the launcher and the OSDs. noctalia keeps its own
+#       mode in its settings.toml and does not watch the portal, so setting
+#       gsettings alone leaves the shell in whatever it was — which is the
+#       state this script exists to prevent.
+#
+# A note on GTK3: only the Sweet-Dark themes are installed, so `gtk-theme` is
+# left alone. GTK3 apps that follow `color-scheme` will switch; ones that only
+# honour the theme name will stay dark. Install a light Sweet and add it here
+# if that starts to matter.
+set -euo pipefail
+
+usage() { sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; }
+
+current() {
+    # noctalia's answer rather than gsettings', because noctalia is the one
+    # that cannot be nudged from elsewhere: if the two have drifted, the
+    # toggle should move away from what is on screen.
+    local mode
+    mode=$(noctalia msg theme-mode-get 2>/dev/null || true)
+    case "$mode" in
+        light|dark) printf '%s\n' "$mode"; return ;;
+    esac
+    case "$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null)" in
+        *prefer-light*) printf 'light\n' ;;
+        *)              printf 'dark\n' ;;
+    esac
+}
+
+apply() {
+    local mode="$1" scheme
+    [ "$mode" = light ] && scheme=prefer-light || scheme=prefer-dark
+
+    # The portal first: it is the one with the most listeners, and the apps
+    # that watch it repaint in the same frame they are told.
+    gsettings set org.gnome.desktop.interface color-scheme "$scheme"
+
+    # Then the shell. `|| true` because a toggle that half-worked is still
+    # better than one that aborts with the desktop in two minds — and
+    # noctalia may legitimately not be running.
+    noctalia msg theme-mode-set "$mode" >/dev/null 2>&1 || true
+
+    printf '%s\n' "$mode"
+}
+
+case "${1:-toggle}" in
+    dark|light)  apply "$1" ;;
+    toggle)      [ "$(current)" = dark ] && apply light || apply dark ;;
+    --print|-p)  current ;;
+    -h|--help)   usage ;;
+    *)           usage >&2; exit 2 ;;
+esac
